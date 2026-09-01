@@ -102,12 +102,19 @@ runner.load(args.checkpoint_file, load_cfg={"actor": True}, strict=True, map_loc
 policy = runner.get_inference_policy(device=args.device)
 
 obs, _ = wrapped.reset()
-frames = []
 steps_per_episode = args.steps
 if args.episodes > 1:
     steps_per_episode = args.steps_per_episode or wrapped.max_episode_length
 total_steps = args.episodes * steps_per_episode
 start_azimuth = env_cfg.viewer.azimuth
+out = Path(args.out)
+writer = imageio.get_writer(
+    out,
+    fps=args.fps,
+    quality=8,
+    macro_block_size=1,
+)
+frame_count = 0
 
 
 def camera_azimuth_for_episode(episode: int) -> float | None:
@@ -124,37 +131,43 @@ def camera_azimuth_for_episode(episode: int) -> float | None:
     return heading_deg + heading_relative_azimuths[episode]
 
 
-with torch.no_grad():
-    for episode in range(args.episodes):
-        if episode:
-            wrapped.seed(args.seed + episode)
-            obs, _ = wrapped.reset()
-        fixed_azimuth = camera_azimuth_for_episode(episode)
-        if fixed_azimuth is not None:
-            print(
-                f"  episode {episode + 1}: fixed camera azimuth "
-                f"{fixed_azimuth:.1f} degrees"
-            )
-        for step in range(steps_per_episode):
-            actions = policy(obs)
-            obs, _, _, _ = wrapped.step(actions)
-            global_step = episode * steps_per_episode + step
-            if env._offline_renderer is not None:
-                progress = global_step / max(total_steps - 1, 1)
-                env._offline_renderer._cam.azimuth = (
-                    fixed_azimuth
-                    if fixed_azimuth is not None
-                    else start_azimuth + args.orbit_degrees * progress
-                )
-            frame = env.render()
-            if frame is not None:
-                frames.append(np.asarray(frame))
-            if (global_step + 1) % 50 == 0:
+try:
+    with torch.no_grad():
+        for episode in range(args.episodes):
+            if episode:
+                wrapped.seed(args.seed + episode)
+                obs, _ = wrapped.reset()
+            fixed_azimuth = camera_azimuth_for_episode(episode)
+            if fixed_azimuth is not None:
                 print(
-                    f"  {global_step + 1}/{total_steps} steps, "
-                    f"episode {episode + 1}/{args.episodes}, {len(frames)} frames"
+                    f"  episode {episode + 1}: fixed camera azimuth "
+                    f"{fixed_azimuth:.1f} degrees"
                 )
+            for step in range(steps_per_episode):
+                actions = policy(obs)
+                obs, _, _, _ = wrapped.step(actions)
+                global_step = episode * steps_per_episode + step
+                if env._offline_renderer is not None:
+                    progress = global_step / max(total_steps - 1, 1)
+                    env._offline_renderer._cam.azimuth = (
+                        fixed_azimuth
+                        if fixed_azimuth is not None
+                        else start_azimuth + args.orbit_degrees * progress
+                    )
+                frame = env.render()
+                if frame is not None:
+                    writer.append_data(np.asarray(frame))
+                    frame_count += 1
+                if (global_step + 1) % 50 == 0:
+                    print(
+                        f"  {global_step + 1}/{total_steps} steps, "
+                        f"episode {episode + 1}/{args.episodes}, "
+                        f"{frame_count} frames"
+                    )
+finally:
+    writer.close()
 
-out = Path(args.out)
-imageio.mimwrite(out, frames, fps=args.fps, quality=8, macro_block_size=1)
-print(f"wrote {out} ({len(frames)} frames @ {args.fps}fps, {args.width}x{args.height})")
+print(
+    f"wrote {out} ({frame_count} frames @ {args.fps}fps, "
+    f"{args.width}x{args.height})"
+)

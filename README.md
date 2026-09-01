@@ -4,9 +4,9 @@ Wind up, throw a 24 mm ball from the beak, and recover to a two-foot stand.
 
 [![Microduck releasing the ball](media/preview.png)](media/preview.mp4)
 
-The linked preview shows three separately reset episodes from the released
-checkpoint at half speed with locked cameras: the ball comes toward the lens,
-then crosses to the right and left of it.
+The linked 4K preview shows three separately reset episodes from the released
+checkpoint at half speed with low, locked cameras: the ball comes toward the
+lens, then crosses to the right and left of it.
 
 - **Weights and model card:**
   [q2p/microduck-beak-throw](https://huggingface.co/q2p/microduck-beak-throw)
@@ -91,7 +91,8 @@ robotctl robot do beak-throw     # EMPTY BEAK FIRST
 - `runtime/`: mandatory Microduck runtime patch and opt-in configuration.
 - `hardware/`: supervised test protocol and editable compliant liner.
 - `docs/`: provenance, acceptance, and software-validation reports.
-- `media/preview.mp4`: three half-speed locked views—toward, right, and left.
+- `media/preview.mp4`: three 4K, half-speed, low locked views—toward, right,
+  and left.
 
 **Contract** `obs[1,61] f32 → actions[1,14] f32`, normalizer baked in, 50 Hz,
 kind episodic, duration 2.4 s, entry pose standing.
