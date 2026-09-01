@@ -1,81 +1,101 @@
-# Microduck Beak Throw
+# beak-throw
 
-An experimental reinforcement-learning policy that makes a Microduck wind up,
-throw a 24 mm ball from its beak, and recover to standing.
+Wind up, throw a 24 mm ball from the beak, and recover to a two-foot stand.
 
-> **Status: simulation-validated, hardware-unvalidated.** The selected policy
-> passed 50/50 randomized simulator trials only with the mandatory anatomical
-> target clamp. It failed the strict raw-output safety gate. Read
-> [SAFETY.md](SAFETY.md) before considering a supervised hardware test.
+[![Microduck releasing the ball](media/preview.png)](media/preview.mp4)
 
-[![Microduck releasing the ball](media/preview_model_2150.png)](media/preview_model_2150.mp4)
+The linked preview shows three separately reset episodes from the released
+checkpoint, at half speed, while the camera orbits 60 degrees around the duck.
 
-Click the image for the exact selected policy in MuJoCo.
+- **Weights and model card:**
+  [q2p/microduck-beak-throw](https://huggingface.co/q2p/microduck-beak-throw)
+- **Complete tester bundle:**
+  [v0.1.0-sim release](https://github.com/llama/microduck-beak-throw/releases/tag/v0.1.0-sim)
 
-- **Download the weights and model card:**
-  [Hugging Face — q2p/microduck-beak-throw](https://huggingface.co/q2p/microduck-beak-throw)
-- **Download the complete tester bundle:**
-  [GitHub release v0.1.0-sim](https://github.com/llama/microduck-beak-throw/releases/tag/v0.1.0-sim)
-- **Upstream projects:**
-  [microduck_rl](https://github.com/pollen-robotics/microduck_rl) and
-  [Microduck runtime](https://github.com/pollen-robotics/microduck)
+> **Simulation-validated, hardware-unvalidated.** The policy completed 50/50
+> randomized simulator trials only with the mandatory runtime anatomical clamp.
+> It failed the strict raw-output gate. Read [SAFETY.md](SAFETY.md) before any
+> supervised hardware experiment; the first powered run must be empty-beak.
 
-## What it does
+**Command** — one-shot skill: `robotctl robot do beak-throw`. The 14-action
+network controls the body and head. The patched runtime holds the mouth at +20°,
+opens it to +30° over phase 0.30–0.34 of the 2.4-second motion, then hands off
+to the supplied standing policy.
 
-The 61-observation / 14-action policy drives the legs and head at 50 Hz. The
-mouth is not a fifteenth learned action: the runtime holds it at +20 degrees,
-opens it to +30 degrees over phase 0.30–0.34 of the 2.4-second motion, and then
-switches to the packaged standing policy. A shallow compliant liner supplies
-the lip, rear stop, and side cheeks needed to retain a sphere during wind-up.
+**What it does** — throws a 24 mm / 3 g simulated ball about 0.53 m forward.
+The ball is physically retained by compliant pads, a rounded front lip, a rear
+stop, and side cheeks rather than by a weld or teleport.
 
-In 50 deterministic-seed randomized simulator episodes, the exact packaged
-ONNX achieved 50 valid releases, landings, carry/lateral passes, and upright
-recoveries. Median forward carry was 0.525 m; median lateral carry was -0.113 m;
-median final tilt after the stand phase was 0.376 degrees. Its median raw target
-limit excess was 0.751 rad, so the runtime clamp is required and this is not a
-production-accepted policy. Full results are in [docs/ACCEPTANCE.txt](docs/ACCEPTANCE.txt).
+**Limits** — 50/50 randomized trials passed the release, landing, ≥0.50 m
+forward, ≤0.20 m lateral, and hybrid-recovery checks. The raw network exceeded
+the strict target limit in 50/50 trials (median 0.751 rad), making the supplied
+runtime clamp mandatory. Full results: [docs/ACCEPTANCE.txt](docs/ACCEPTANCE.txt).
+
+## Try it in simulation
+
+```bash
+git clone https://github.com/llama/microduck-beak-throw.git
+git clone https://github.com/pollen-robotics/microduck_rl.git && cd microduck_rl
+git checkout d424a0c899f6b33cbd3daeb279913134349c0b63
+git apply ../microduck-beak-throw/training/microduck_rl-shared-files.patch
+rsync -a ../microduck-beak-throw/training/overlay/ ./
+uv sync
+uv run hf download q2p/microduck-beak-throw checkpoints/model_2150.pt --local-dir policies/beak-throw
+```
+
+Linux:
+
+```bash
+uv run play Mjlab-BeakThrow-Hardware-MicroDuck \
+  --checkpoint-file policies/beak-throw/checkpoints/model_2150.pt --num-envs 1
+```
+
+macOS:
+
+```bash
+ln -sf "$(.venv/bin/python -c 'import sys; print(sys.base_prefix)')/lib/libpython3.12.dylib" .venv/libpython3.12.dylib
+.venv/bin/mjpython .venv/bin/play Mjlab-BeakThrow-Hardware-MicroDuck \
+  --checkpoint-file policies/beak-throw/checkpoints/model_2150.pt --num-envs 1
+```
+
+## Try it on the robot
+
+This requires the included runtime patch; it is not a simple policy swap.
+
+```bash
+git clone https://github.com/pollen-robotics/microduck.git && cd microduck
+git checkout 590b986bd8c0d50ae02cb3ea2f59c463b6828168
+hf download q2p/microduck-beak-throw beak_throw.onnx alpha_stand.onnx runtime/microduck-runtime.patch --local-dir beak-throw
+git apply beak-throw/runtime/microduck-runtime.patch
+cp beak-throw/beak_throw.onnx policies/beak_throw.onnx
+cp beak-throw/alpha_stand.onnx policies/alpha_stand.onnx
+scripts/dev-push.sh --docker radxa@<robot>
+```
+
+Then add the values in [runtime/robotd-beak-throw.toml](runtime/robotd-beak-throw.toml)
+to the robot's existing `[policy]` section, restart `robotd`, and follow
+[hardware/INSTALL_AND_TEST.md](hardware/INSTALL_AND_TEST.md). Measure and adapt
+the reference liner before any loaded test.
+
+```bash
+robotctl health
+robotctl monitor
+robotctl robot enable
+robotctl robot do beak-throw     # EMPTY BEAK FIRST
+```
 
 ## Repository map
 
-- `training/`: a reproducible patch and overlay for the exact upstream
-  `microduck_rl` base used for the experiments.
-- `runtime/`: the Microduck runtime patch and opt-in configuration.
-- `hardware/`: the supervised test protocol and editable reference liner.
-- `docs/`: provenance, evaluation, and software-validation reports.
-- `media/`: preview of checkpoint `model_2150.pt`, the selected policy.
+- `training/`: reproducible patch and overlay for the exact `microduck_rl` base.
+- `runtime/`: mandatory Microduck runtime patch and opt-in configuration.
+- `hardware/`: supervised test protocol and editable compliant liner.
+- `docs/`: provenance, acceptance, and software-validation reports.
+- `media/preview.mp4`: three half-speed episodes with an orbiting camera.
 
-Weights are intentionally hosted on Hugging Face. The GitHub release also
-contains a self-contained tester ZIP with both ONNX policies, runtime patch,
-liner, checksums, and instructions.
+**Contract** `obs[1,61] f32 → actions[1,14] f32`, normalizer baked in, 50 Hz,
+kind episodic, duration 2.4 s, entry pose standing.
 
-## Reproduce in the simulator
+**Provenance** source base `pollen-robotics/microduck_rl@d424a0c`; runtime base
+`pollen-robotics/microduck@590b986`; selected checkpoint `model_2150.pt`.
 
-First reconstruct the training checkout by following
-[training/README.md](training/README.md). Download `model_2150.pt` from the
-Hugging Face repository into that checkout, then on macOS run:
-
-```bash
-.venv/bin/mjpython .venv/bin/play Mjlab-BeakThrow-Hardware-MicroDuck \
-  --checkpoint-file model_2150.pt --num-envs 1
-```
-
-On Linux, use the same `play` command through the project's normal `uv run`
-environment rather than `mjpython`.
-
-## Hardware path
-
-The deployable sequence is a hybrid controller: throw policy for 2.4 seconds,
-then the supplied standing policy. Start at [hardware/INSTALL_AND_TEST.md](hardware/INSTALL_AND_TEST.md).
-The first powered trial must have an empty beak. The reference liner must be
-measured and adapted to the actual bill; its mounting face has not been checked
-against a physical robot. Never test near people, animals, glass, or electronics.
-
-## Provenance and license
-
-The source overlay is based on `pollen-robotics/microduck_rl` commit
-`d424a0c899f6b33cbd3daeb279913134349c0b63`. The runtime patch is based on
-`pollen-robotics/microduck` commit
-`590b986bd8c0d50ae02cb3ea2f59c463b6828168`.
-
-Code and released model weights are Apache-2.0 licensed. Upstream robot assets
-remain subject to their original notices and licenses.
+Apache-2.0. Upstream robot assets retain their original notices and licenses.
