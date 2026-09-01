@@ -1,0 +1,2771 @@
+diff --git a/README.md b/README.md
+index 308ff4c..17bde82 100644
+--- a/README.md
++++ b/README.md
+@@ -69,6 +69,9 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
+ | `Mjlab-StandUp-{Flat,Rough}-MicroDuck` | flat/rough | Stand up from face-down/face-up/sitting, then hold the stand + body-pose control |
+ | `Mjlab-SitStand-{Flat,Rough}-MicroDuck` | flat/rough | Commanded sit ↔ stand in one policy, gently, head commandable |
+ | `Mjlab-GroundPick-{Flat,Rough}-MicroDuck` | flat/rough | Crouch and touch the ground with the mouth tip, return to stand |
++| `Mjlab-BeakThrow-Flat-MicroDuck` | flat | Phase-controlled beak release; maximize forward carry of a 24 mm / 3 g ball |
++| `Mjlab-BeakThrow-Cinematic-MicroDuck` | flat | Showcase model_1250 with a visible mouth and clean simulator-only latch/release |
++| `Mjlab-BeakThrow-Cinematic-Train-MicroDuck` | flat | Conservative continuation for a longer, straighter, smoother cinematic throw |
+ | `Mjlab-BallKick-Flat-MicroDuck` | flat | Kick a 70 mm / 15 g ball forward (actor is ball-blind) |
+ | `Mjlab-Roulade-Flat-MicroDuck` | flat | Forward roll over the head, land back on the feet |
+ | `Mjlab-Velocity-Flat-MicroDuck-Rollers` | flat | Roller-skate velocity tracking (passive wheels under the feet) |
+@@ -90,6 +93,11 @@ uv run scripts/infer_policy.py --walking walk.onnx --standing stand.onnx \
+ Keyboard-driven (velocity commands, `G` ground pick, `Y` sit/stand, `R` roulade,
+ `K`/`L` kicks); `--debug`, `--save-csv`, `--record` support sim2real comparisons.
+ 
++The beak throw has its own measured training and evaluation runbook in
++[`docs/beak_throw.md`](docs/beak_throw.md). It starts from a learned balance
++checkpoint and neutralizes only the repurposed phase inputs, rather than asking
++PPO to rediscover standing and throwing simultaneously.
++
+ ### Backlash variants
+ 
+ Every main task has a **Backlash** twin that trains on a model with ±1° of gear
+diff --git a/scripts/hf/README.md b/scripts/hf/README.md
+index f77b1f2..94e3432 100644
+--- a/scripts/hf/README.md
++++ b/scripts/hf/README.md
+@@ -38,14 +38,19 @@ Useful flags:
+ - `--run-name <tag>` — overrides the auto-generated `<task>-<timestamp>` name
+ - `--no-uv-cache` — disable the persistent `uv` cache bucket (first-run cost on every run)
+ - `--no-wandb` — don't forward a wandb key
++- `--bootstrap-checkpoint <path>` — convert a Header checkpoint into BeakThrow
++  iteration zero (phase columns/optimizer/curriculum are reset)
++- `--resume-checkpoint <path>` — continue an existing BeakThrow checkpoint;
++  the cinematic-train runner preserves model/normalizer/iteration state but
++  starts its gentler optimizer and reduces action std to 0.18
+ 
+ (`uv run scripts/hf/train_hf.py <task> ...` still works — it's a shim to the
+ same code, which lives in `src/mjlab_microduck/hf_jobs.py`.)
+ 
+ ## What happens under the hood
+ 
+-1. `git ls-files` snapshots tracked + uncommitted files of the repo you run
+-   from (worktree-aware) → `src-<stamp>.tar.gz`.
++1. `git ls-files` snapshots tracked and untracked working source (worktree-aware),
++   excluding local checkpoints and root media → `src-<stamp>.tar.gz`.
+ 2. Tarball is uploaded to private dataset `<namespace>/mjlab-microduck-src`.
+ 3. Private model repo `<namespace>/<run-name>` is created for checkpoints.
+ 4. A private HF bucket `<namespace>/mjlab-uv-cache` is mounted at `/uv-cache`
+diff --git a/scripts/infer_policy.py b/scripts/infer_policy.py
+index abbf257..a03f43e 100755
+--- a/scripts/infer_policy.py
++++ b/scripts/infer_policy.py
+@@ -300,22 +300,41 @@ class PolicyInference:
+         print(f"Body IDs:")
+         print(f"  trunk_base: id={self.trunk_base_id}")
+ 
+-        # Joint information
+-        self.n_joints = model.nu
+-
+-        # For robots with passive/interspersed joints (e.g. roller skates), the actuated
+-        # joints are not contiguous in qpos/qvel. Compute the correct indices from the
+-        # actuator transmission joint IDs so extraction works for any joint ordering.
++        # Joint information. Auxiliary actuators whose joint starts with
++        # ``passive_`` (notably BeakThrow's real mouth servo) are deliberately
++        # external to the 14-action neural-policy ABI. They remain controllable
++        # through ``data.ctrl`` but must not expand observations/actions.
++        self.policy_actuator_ids = np.asarray(
++            [
++                i
++                for i in range(model.nu)
++                if not model.joint(model.actuator_trnid[i, 0]).name.startswith("passive_")
++            ],
++            dtype=int,
++        )
++        self.aux_actuator_ids = np.asarray(
++            [i for i in range(model.nu) if i not in set(self.policy_actuator_ids)],
++            dtype=int,
++        )
++        self.n_joints = len(self.policy_actuator_ids)
++
++        # For robots with passive/interspersed joints, the policy joints are not
++        # necessarily contiguous in qpos/qvel. Resolve them through transmission IDs.
+         self.joint_qpos_indices = [
+-            int(model.jnt_qposadr[model.actuator_trnid[i, 0]]) for i in range(model.nu)
++            int(model.jnt_qposadr[model.actuator_trnid[i, 0]])
++            for i in self.policy_actuator_ids
+         ]
+         self.joint_qvel_indices = [
+-            int(model.jnt_dofadr[model.actuator_trnid[i, 0]]) for i in range(model.nu)
++            int(model.jnt_dofadr[model.actuator_trnid[i, 0]])
++            for i in self.policy_actuator_ids
+         ]
+ 
+         # Default pose for the policy (flexed legs)
+         self.default_pose = DEFAULT_POSE[:self.n_joints]
+-        print(f"Number of actuators: {self.n_joints}")
++        print(
++            f"Policy actuators: {self.n_joints} "
++            f"(auxiliary external actuators: {len(self.aux_actuator_ids)})"
++        )
+         print(f"Default pose: {self.default_pose}")
+         print(f"Action scale: {self.action_scale}")
+ 
+@@ -699,6 +718,25 @@ class PolicyInference:
+         foot = behavior.split("_")[1]
+         print(f"Ball placed at ({bx:.3f}, {by:.3f}) in front of the {foot} foot")
+ 
++    def _place_ball_in_tray(self):
++        """Teleport the ball just above the bill tray, matching training's
++        reset_ball_in_tray (offset from the trunk root in the yaw frame)."""
++        if self.ball_qpos_adr is None or self.ball_qvel_adr is None:
++            print("No ball in scene (use --header to load the toss scene)")
++            return
++        # Must match TOSS_TRAY_OFFSET_FROM_ROOT + drop height in the header env.
++        from mjlab_microduck.robot.microduck_constants import TOSS_TRAY_OFFSET_FROM_ROOT
++        off_x, off_z = TOSS_TRAY_OFFSET_FROM_ROOT[0], TOSS_TRAY_OFFSET_FROM_ROOT[2] + 0.018
++        adr = self._trunk_qpos_adr
++        x, y, z = (float(self.data.qpos[adr + i]) for i in range(3))
++        qw, qx, qy, qz = self.data.qpos[adr + 3:adr + 7]
++        yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
++        bx = x + math.cos(yaw) * off_x
++        by = y + math.sin(yaw) * off_x
++        self.data.qpos[self.ball_qpos_adr:self.ball_qpos_adr + 7] = [bx, by, z + off_z, 1, 0, 0, 0]
++        self.data.qvel[self.ball_qvel_adr:self.ball_qvel_adr + 6] = 0.0
++        print(f"Ball dropped into the bill tray at ({bx:.3f}, {by:.3f}, {z + off_z:.3f})")
++
+     def update_behavior(self, dt: float):
+         """Advance the behavior timer; hand back to walking/standing when done."""
+         if self.behavior_mode is None:
+@@ -793,12 +831,12 @@ class PolicyInference:
+         else:
+             target_positions = self.default_pose + action * self.action_scale
+ 
+-        self.data.ctrl[:] = target_positions
++        self.data.ctrl[self.policy_actuator_ids] = target_positions
+         # Legacy mode: head_offset is an external perturbation added on top of
+         # the policy output. New mode: head_offset is a COMMAND fed into the
+         # policy's obs, so the policy itself produces the offset head pose.
+         if not self.new_cmd_obs:
+-            self.data.ctrl[5:9] += self.head_offset
++            self.data.ctrl[self.policy_actuator_ids[5:9]] += self.head_offset
+ 
+ 
+ def main():
+@@ -813,6 +851,7 @@ def main():
+     parser.add_argument("--kick-left", type=str, default=None, help="Path to LEFT-foot ball kick policy ONNX (press K to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
+     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
+     parser.add_argument("--roulade", type=str, default=None, help="Path to roulade (forward roll) policy ONNX (press R to trigger). Requires --new-cmd-obs.")
++    parser.add_argument("--header", type=str, default=None, help="Path to Header (bill-tray toss) policy ONNX. Requires --new-cmd-obs. Loads the toss scene (bill tray + 24mm ball, ball-transparent head hulls) and runs the policy standalone in the walking slot; press N to drop a fresh ball into the tray.")
+     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
+     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
+     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
+@@ -821,6 +860,9 @@ def main():
+     parser.add_argument("--action-scale", type=float, default=1.0, help="Action scale (default: 1.0)")
+     parser.add_argument("--raw-accelerometer", action="store_true", help="Use raw accelerometer instead of projected gravity")
+     parser.add_argument("--delay", type=int, nargs='*', default=None, help="Enable actuator delay: --delay MIN MAX or --delay LAG")
++    parser.add_argument("--start-paused", action="store_true", help="Freeze physics at the initial pose until T is pressed, then run the policy from t=0. (Physics is frozen, not held: the low-kp servos cannot hold a static pose, so a held pause would collapse the robot before the policy starts.)")
++    parser.add_argument("--spawn-z", type=float, default=None, help="Initial trunk height (m). Default 0.125 (0.1385 on rollers). Balance-critical policies (flamingo) want ~0.117: spawning higher free-drops the robot onto its feet and the landing bounce can exceed their recovery margin.")
++    parser.add_argument("--slow", type=float, default=1.0, help="Real-time slowdown factor (2.0 = half speed). Physics is unchanged; only wall-clock pacing.")
+     parser.add_argument("--debug", action="store_true", help="Print observations and actions")
+     parser.add_argument("--save-csv", type=str, default=None, help="Save observations and actions to CSV file")
+     parser.add_argument("--record", type=str, default=None, help="Enable recording mode: save observations to pickle file on Ctrl+C")
+@@ -844,6 +886,14 @@ def main():
+                              "compliant PU sole. e.g. --foot-solref 0.04")
+     args = parser.parse_args()
+ 
++    # The Header policy runs standalone: route it into the walking slot before
++    # the slot validation below.
++    if args.header and not args.walking:
++        args.walking = args.header
++        print("Header policy loaded into the walking slot (runs from t=0 at zero command)")
++    if args.header and not args.new_cmd_obs:
++        parser.error("--header policies use the unified 13D command obs (61D); add --new-cmd-obs")
++
+     if not args.walking and not args.standing and not args.sitstand:
+         parser.error("At least one of --walking, --standing or --sitstand must be provided")
+     if args.sitstand and not args.new_cmd_obs:
+@@ -870,15 +920,22 @@ def main():
+             print("Error: --delay accepts 0, 1, or 2 arguments")
+             return
+ 
+-    # Load MuJoCo model. Kick policies get a scene with a ball to kick.
+-    if args.roller:
+-        xml_path = MICRODUCK_ROLLERS_XML
+-    elif args.kick_left or args.kick_right:
+-        xml_path = MICRODUCK_BALL_XML
++    # Load MuJoCo model. Kick policies get a scene with a ball to kick; the
++    # Header policy gets the toss scene (bill tray + ball) built from the same
++    # spec transform as training (apply_toss_variant).
++    if args.header:
++        from mjlab_microduck.robot.microduck_constants import build_toss_scene_spec
++        print("Building toss scene (scene.xml + bill tray + toss ball)")
++        model = build_toss_scene_spec().compile()
+     else:
+-        xml_path = MICRODUCK_XML
+-    print(f"Loading MuJoCo model from: {xml_path}")
+-    model = mujoco.MjModel.from_xml_path(xml_path)
++        if args.roller:
++            xml_path = MICRODUCK_ROLLERS_XML
++        elif args.kick_left or args.kick_right:
++            xml_path = MICRODUCK_BALL_XML
++        else:
++            xml_path = MICRODUCK_XML
++        print(f"Loading MuJoCo model from: {xml_path}")
++        model = mujoco.MjModel.from_xml_path(xml_path)
+     model.opt.timestep = 0.005
+     data = mujoco.MjData(model)
+ 
+@@ -973,12 +1030,18 @@ def main():
+     qpos_adr = model.jnt_qposadr[freejoint_id]
+     data.qpos[qpos_adr + 0] = 0.0
+     data.qpos[qpos_adr + 1] = 0.0
+-    data.qpos[qpos_adr + 2] = 0.1385 if args.roller else 0.125  # rollers add 13.5mm height
++    if args.spawn_z is not None:
++        data.qpos[qpos_adr + 2] = args.spawn_z
++    else:
++        data.qpos[qpos_adr + 2] = 0.1385 if args.roller else 0.125  # rollers add 13.5mm height
+     data.qpos[qpos_adr + 3:qpos_adr + 7] = [1, 0, 0, 0]
+     for i, qpos_idx in enumerate(policy.joint_qpos_indices):
+         data.qpos[qpos_idx] = policy.default_pose[i]
+-    data.ctrl[:] = policy.default_pose
++    data.ctrl[:] = 0.0
++    data.ctrl[policy.policy_actuator_ids] = policy.default_pose
+     mujoco.mj_forward(model, data)
++    if args.header:
++        policy._place_ball_in_tray()
+ 
+     # Verify observation size
+     test_obs = policy.get_observations()
+@@ -1035,7 +1098,7 @@ def main():
+ 
+     csv_data = [] if args.save_csv else None
+     recorded_observations = [] if args.record else None
+-    policy_enabled = not args.record
++    policy_enabled = not args.record and not args.start_paused
+     policy_enable_time = None
+     original_kp = None
+     if args.record:
+@@ -1135,6 +1198,8 @@ def main():
+                 policy.trigger_behavior("kick_right")
+             elif key == "r":
+                 policy.trigger_behavior("roulade")
++            elif key == "n":
++                policy._place_ball_in_tray()
+             elif key == "q":
+                 quit_requested = True
+                 print("Quit requested")
+@@ -1202,6 +1267,7 @@ def main():
+     print("  K:                kick with LEFT foot (requires --kick-left)")
+     print("  L:                kick with RIGHT foot (requires --kick-right)")
+     print("  R:                roulade / forward roll (requires --roulade)")
++    print("  N:                drop a fresh ball into the bill tray (requires --header)")
+     print(f"  P:                random push (trunk vel = {PUSH_MAX:.1f} m/s in random direction)")
+     print("  Q:                quit")
+     print("  [ Body pose mode — press B to toggle ]")
+@@ -1234,12 +1300,26 @@ def main():
+         try:
+             prev_step_time = time.time()
+ 
++            # --start-paused: freeze PHYSICS (not just the policy) until the
++            # first T. Holding the default pose with the real low-kp servos
++            # collapses the robot within ~1s (it cannot stand open-loop), so
++            # "paused = hold position" would hand balance-critical policies an
++            # already-fallen start state.
++            start_paused_frozen = args.start_paused
++
+             while viewer.is_running() and not quit_requested:
+                 step_start = time.time()
+ 
+                 for key in term.get_keys():
+                     handle_key(key)
+ 
++                if policy_enabled:
++                    start_paused_frozen = False
++                if start_paused_frozen:
++                    viewer.sync()
++                    time.sleep(0.05)
++                    continue
++
+                 if not policy_enabled and policy_enable_time is not None:
+                     if step_start >= policy_enable_time:
+                         policy_enabled = True
+@@ -1350,7 +1430,7 @@ def main():
+                 viewer.sync()
+ 
+                 elapsed = time.time() - step_start
+-                sleep_time = control_dt - elapsed
++                sleep_time = control_dt * args.slow - elapsed
+                 if sleep_time > 0:
+                     time.sleep(sleep_time)
+ 
+diff --git a/src/mjlab_microduck/hf_jobs.py b/src/mjlab_microduck/hf_jobs.py
+index 37fd23e..3807c66 100644
+--- a/src/mjlab_microduck/hf_jobs.py
++++ b/src/mjlab_microduck/hf_jobs.py
+@@ -25,9 +25,10 @@ private HF model repo.
+ from __future__ import annotations
+ 
+ import argparse
++import base64
+ import datetime as dt
++import json
+ import os
+-import shlex
+ import subprocess
+ import sys
+ import tarfile
+@@ -78,9 +79,24 @@ mkdir -p logs/rsl_rl
+ nohup uv run python scripts/hf/uploader.py > /tmp/uploader.log 2>&1 &
+ UPLOADER_PID=$!
+ 
+-echo "[bootstrap] starting training: uv run train $TRAIN_ARGS"
++echo "[bootstrap] starting training"
+ set +e
+-uv run train $TRAIN_ARGS
++# TRAIN_ARGS_B64 contains a JSON argv rather than a shell command.  Expanding
++# a shell-quoted command from an environment variable is not safe or correct:
++# quotes produced by shlex.quote become literal characters after parameter
++# expansion (e.g. '^bootstrap$' was passed with both quote marks).  Decode the
++# exact argv and exec it without another shell-parsing pass.
++uv run python - <<'PY'
++import base64
++import json
++import os
++import shlex
++
++train_args = json.loads(base64.urlsafe_b64decode(os.environ["TRAIN_ARGS_B64"]))
++argv = ["uv", "run", "train", *train_args]
++print("[bootstrap] exec:", shlex.join(argv), flush=True)
++os.execvp(argv[0], argv)
++PY
+ TRAIN_RC=$?
+ set -e
+ 
+@@ -95,7 +111,6 @@ CKPT_ONE_SHOT=1 uv run python scripts/hf/uploader.py || true
+ # an export failure must not mark a successful training as failed.
+ if [ "$TRAIN_RC" -eq 0 ] && [ "${AUTO_EXPORT:-1}" = "1" ]; then
+     set +e
+-    TASK_ID=${TRAIN_ARGS%% *}
+     CKPT=$(ls -t logs/rsl_rl/*/model_*.pt 2>/dev/null | head -1)
+     if [ -n "$CKPT" ]; then
+         echo "[bootstrap] auto-exporting ONNX from $(basename "$CKPT")"
+@@ -148,23 +163,50 @@ def _repo_root() -> Path:
+     return Path(out.decode().strip())
+ 
+ 
+-def _build_tarball(repo_root: Path, out_path: Path) -> str:
+-    """Create a tarball of HEAD + uncommitted tracked changes. Returns short SHA."""
++def _encode_train_args(args: list[str]) -> str:
++    """Encode an argv for lossless transport through the Jobs environment."""
++    payload = json.dumps(args, ensure_ascii=True, separators=(",", ":")).encode()
++    return base64.urlsafe_b64encode(payload).decode("ascii")
++
++
++def _build_tarball(
++    repo_root: Path,
++    out_path: Path,
++    extra_files: dict[Path, str] | None = None,
++) -> str:
++    """Create a source tarball of tracked and untracked working files.
++
++    Generated checkpoints and root-level media are deliberately excluded;
++    requested bootstrap/resume checkpoints are added back through
++    ``extra_files`` at their exact training paths.
++    """
+     sha = subprocess.check_output(
+         ["git", "rev-parse", "--short", "HEAD"], cwd=repo_root
+     ).decode().strip()
+ 
+-    # Use `git ls-files` so we include tracked-but-modified files (working tree
+-    # state) but skip ignored junk (.venv, logs, *.onnx, wandb/, etc.).
++    # Include untracked source files too: new task modules are routinely tested
++    # before they are committed. Skip ignored junk plus large local run/media
++    # artifacts that happen not to be covered by .gitignore.
+     files = subprocess.check_output(
+         ["git", "ls-files", "-co", "--exclude-standard"], cwd=repo_root
+     ).decode().splitlines()
++    excluded_roots = {"checkpoints_hf", "logs", "wandb"}
++    root_media_suffixes = {".mp4", ".mov", ".pt", ".onnx"}
+ 
+     with tarfile.open(out_path, "w:gz") as tar:
+         for rel in files:
++            rel_path = Path(rel)
++            if rel_path.parts and rel_path.parts[0] in excluded_roots:
++                continue
++            if len(rel_path.parts) == 1 and rel_path.suffix.lower() in root_media_suffixes:
++                continue
+             p = repo_root / rel
+             if p.exists() and p.is_file():
+                 tar.add(p, arcname=rel)
++        for path, arcname in (extra_files or {}).items():
++            if not path.is_file():
++                raise FileNotFoundError(path)
++            tar.add(path, arcname=arcname)
+     return sha
+ 
+ 
+@@ -277,6 +319,21 @@ def submit(argv: list[str]) -> int:
+         default=None,
+         help="HF model repo for checkpoints. Defaults to <namespace>/<run-name>",
+     )
++    ap.add_argument(
++        "--bootstrap-checkpoint",
++        type=Path,
++        default=None,
++        help="Header checkpoint to transfer into BeakThrow. It is safely patched, "
++        "bundled with the private source snapshot, and loaded as iteration zero.",
++    )
++    ap.add_argument(
++        "--resume-checkpoint",
++        type=Path,
++        default=None,
++        help="BeakThrow checkpoint to continue without bootstrap surgery. Physical "
++        "BeakThrow preserves the full state; Cinematic-Train preserves networks and "
++        "iteration but intentionally resets optimizer/exploration.",
++    )
+     ap.add_argument(
+         "--uv-cache-bucket",
+         default=None,
+@@ -299,6 +356,96 @@ def submit(argv: list[str]) -> int:
+     )
+     args, train_args = ap.parse_known_args(argv)
+ 
++    if args.bootstrap_checkpoint is not None and args.resume_checkpoint is not None:
++        print(
++            "error: choose only one of --bootstrap-checkpoint or --resume-checkpoint",
++            file=sys.stderr,
++        )
++        return 1
++
++    bootstrap_arcname: str | None = None
++    resume_arcname: str | None = None
++    if args.bootstrap_checkpoint is not None:
++        if args.task != "Mjlab-BeakThrow-Flat-MicroDuck":
++            print(
++                "error: --bootstrap-checkpoint currently supports only "
++                "Mjlab-BeakThrow-Flat-MicroDuck",
++                file=sys.stderr,
++            )
++            return 1
++        conflicting = ("--agent.resume", "--agent.load-run", "--agent.load-checkpoint")
++        if any(arg in train_args for arg in conflicting):
++            print(
++                "error: --bootstrap-checkpoint already configures resume/load flags; "
++                "remove the manual --agent.resume/--agent.load-* arguments",
++                file=sys.stderr,
++            )
++            return 1
++        if not args.bootstrap_checkpoint.is_file():
++            print(
++                f"error: bootstrap checkpoint does not exist: {args.bootstrap_checkpoint}",
++                file=sys.stderr,
++            )
++            return 1
++        bootstrap_arcname = (
++            "logs/rsl_rl/microduck_beak_throw/bootstrap/model_0.pt"
++        )
++        train_args.extend(
++            [
++                "--agent.resume",
++                "True",
++                "--agent.load-run",
++                "^bootstrap$",
++                "--agent.load-checkpoint",
++                "^model_0.pt$",
++            ]
++        )
++    elif args.resume_checkpoint is not None:
++        resume_experiments = {
++            "Mjlab-BeakThrow-Flat-MicroDuck": "microduck_beak_throw",
++            "Mjlab-BeakThrow-Hardware-MicroDuck": (
++                "microduck_beak_throw_hardware"
++            ),
++            "Mjlab-BeakThrow-Cinematic-Train-MicroDuck": (
++                "microduck_beak_cinematic_train"
++            ),
++        }
++        if args.task not in resume_experiments:
++            print(
++                "error: --resume-checkpoint currently supports only the "
++                "physical, hardware, or cinematic-train BeakThrow tasks",
++                file=sys.stderr,
++            )
++            return 1
++        conflicting = ("--agent.resume", "--agent.load-run", "--agent.load-checkpoint")
++        if any(arg in train_args for arg in conflicting):
++            print(
++                "error: --resume-checkpoint already configures resume/load flags; "
++                "remove the manual --agent.resume/--agent.load-* arguments",
++                file=sys.stderr,
++            )
++            return 1
++        if not args.resume_checkpoint.is_file():
++            print(
++                f"error: continuation checkpoint does not exist: {args.resume_checkpoint}",
++                file=sys.stderr,
++            )
++            return 1
++        resume_arcname = (
++            f"logs/rsl_rl/{resume_experiments[args.task]}/"
++            "continuation/model_resume.pt"
++        )
++        train_args.extend(
++            [
++                "--agent.resume",
++                "True",
++                "--agent.load-run",
++                "^continuation$",
++                "--agent.load-checkpoint",
++                "^model_resume.pt$",
++            ]
++        )
++
+     api = HfApi()
+     try:
+         namespace = _pick_namespace(api, args.namespace)
+@@ -320,7 +467,8 @@ def submit(argv: list[str]) -> int:
+ 
+     env: dict[str, str] = {
+         "CKPT_REPO": ckpt_repo,
+-        "TRAIN_ARGS": " ".join(shlex.quote(a) for a in [args.task, *train_args]),
++        "TASK_ID": args.task,
++        "TRAIN_ARGS_B64": _encode_train_args([args.task, *train_args]),
+     }
+     secrets: dict[str, str] = {"HF_TOKEN": token}
+ 
+@@ -357,8 +505,35 @@ def submit(argv: list[str]) -> int:
+     # 1. Build tarball
+     with tempfile.TemporaryDirectory() as td:
+         tar_path = Path(td) / f"src-{stamp}.tar.gz"
++        extra_files: dict[Path, str] = {}
++        if bootstrap_arcname is not None:
++            from mjlab_microduck.beak_bootstrap import prepare_beak_bootstrap_file
++
++            prepared_path = Path(td) / "beak-bootstrap.pt"
++            prepare_beak_bootstrap_file(args.bootstrap_checkpoint, prepared_path)
++            extra_files[prepared_path] = bootstrap_arcname
++            print(
++                f"[bootstrap] transferred {args.bootstrap_checkpoint.name} "
++                "(phase inputs neutralized; optimizer/curriculum reset)"
++            )
++        elif resume_arcname is not None:
++            extra_files[args.resume_checkpoint] = resume_arcname
++            if args.task in {
++                "Mjlab-BeakThrow-Cinematic-Train-MicroDuck",
++                "Mjlab-BeakThrow-Hardware-MicroDuck",
++            }:
++                resume_note = (
++                    "networks/iteration preserved; optimizer reset and std capped by "
++                    "task-specific continuation runner"
++                )
++            else:
++                resume_note = "optimizer/curriculum/iteration preserved"
++            print(
++                f"[continuation] transferred {args.resume_checkpoint.name} "
++                f"verbatim ({resume_note})"
++            )
+         print(f"[src] building tarball -> {tar_path.name} (from {repo_root})")
+-        sha = _build_tarball(repo_root, tar_path)
++        sha = _build_tarball(repo_root, tar_path, extra_files)
+         size_mb = tar_path.stat().st_size / 1e6
+         print(f"[src] HEAD={sha}, {size_mb:.1f} MB")
+         env["SRC_TARBALL"] = tar_path.name
+diff --git a/src/mjlab_microduck/robot/microduck_constants.py b/src/mjlab_microduck/robot/microduck_constants.py
+index 8aa7b23..9f91701 100644
+--- a/src/mjlab_microduck/robot/microduck_constants.py
++++ b/src/mjlab_microduck/robot/microduck_constants.py
+@@ -1,13 +1,16 @@
++import math
+ import os
+ from pathlib import Path
+ 
+ import mujoco
++import numpy as np
+ from mjlab.actuator import XmlActuatorCfg
+ from mjlab_microduck.actuator import (
+     BacklashEncoderBamActuatorCfg,
+     FrictionDRBamActuatorCfg,
+ )
+ from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
++from mjlab.utils.spec import create_position_actuator
+ from mjlab.utils.spec_config import CollisionCfg
+ 
+ 
+@@ -62,6 +65,383 @@ def get_backlash_spec() -> mujoco.MjSpec:
+     return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_BACKLASH_XML))
+ 
+ 
++# ── Toss variant (Header task): bill tray + ball-transparent head hulls ───────
++# MuJoCo collides meshes by convex hull, so the mouth cavity doesn't exist for
++# physics — a ball near the bill spawns inside the head hull and is ejected
++# (measured 2026-08-30, scratchpad bill tests). The toss variant therefore:
++#   1. adds a `bill_tray` child body on jaw_soft with 5 thin box geoms (floor,
++#      front lip, side rails, back stop) forming a shallow tray on the closed
++#      bill — on the real robot this is a small 3D-printed clip-on;
++#   2. remaps the head collision hulls (top/bottom shell + jaw) to contype=4 /
++#      conaffinity=1 so the toss ball (contype=2 / conaffinity=1) never touches
++#      them, while head↔floor and head↔trunk contacts keep working
++#      ((4&1)|(1&1)=1) for falls and the self-collision sensor.
++# Tray coordinates were measured off the bill shelf at HOME (soft_mouth_top top
++# surface z=0.1067 above trunk, x∈[0.035,0.067]) and are expressed in
++# jaw_soft's local frame; TRAY_LOCAL_QUAT makes the boxes world-axis-aligned at
++# HOME (local frame ≈ 90° about y: world z ↔ local x).
++TRAY_LOCAL_QUAT = (-0.707107, 0.0, -0.707107, 0.0)
++# Lips raised 6mm -> 9mm (header v3 lesson: the GPU-solver landing bounce
++# ejected the 3g ball over 6mm walls within ~6 steps; taller walls + the soft
++# TRAY_SOLREF below make the landing absorbing in any solver).
++# v4 geometry: interior widened so the 24mm ball actually sits ON THE FLOOR
++# plate (v1-v3 interior was 18mm front-to-back — the ball perched on the wall
++# rims, which the GPU solver's landing bounce dislodged in ~6 steps). Interior
++# now 29mm (x) x 40mm (y); walls 6mm thick against soft-contact tunneling.
++# Geom names END IN _collision: mjlab's CollisionCfg(disable_other_geoms=True)
++# silently ZEROES the masks of any entity geom not matching its
++# geom_names_expr — which is how the tray was collision-disabled in header
++# v1-v4 (the GPU ball fell straight through; CPU tests, which never run the
++# mjlab import pipeline, kept passing). All toss-variant masks now live in
++# MICRODUCK_TOSS_COLLISION below; the spec-level masks in apply_toss_variant
++# remain only so plain-MuJoCo (CPU tests / infer_policy) behaves identically.
++# HEAD-TOP mount (2026-08-30 morning redesign, Doug's idea): the bill-mounted
++# tray was physically impossible on the real robot — its widened back half and
++# the held ball sat INSIDE the solid head shell. The head top is real, nearly
++# flat surface (z 0.2647→0.2701 over x −0.03→+0.03 at HOME; crest ~0.270):
++# the tray sits on it like a strapped-on hat, fully outside the shell, and the
++# neck-pitch flick launches from higher up. A true "header".
++TOSS_TRAY_GEOMS = (
++    # (name, pos in jaw_soft frame, box half-sizes in world axes)
++    ("tray_floor_collision",      (0.038901, 0.0,    -0.029001), (0.016, 0.020, 0.0015)),
++    # Front lip LOW (5mm vs 9mm walls): tall walls hold, the short gate in the
++    # throwing direction launches — measured 0.6 vs 2.1 m/s hand-flick.
++    ("tray_lip_front_collision",  (0.043901, 0.0,    -0.046501), (0.003, 0.020, 0.005)),
++    ("tray_rail_left_collision",  (0.047901, 0.023,  -0.029001), (0.016, 0.003, 0.009)),
++    ("tray_rail_right_collision", (0.047901, -0.023, -0.029001), (0.016, 0.003, 0.009)),
++    ("tray_back_collision",       (0.047901, 0.0,    -0.011501), (0.003, 0.020, 0.009)),
++)
++# Soft-ish, critically-damped contact for the featherweight ball (default
++# 0.02s timeconst is stiff relative to 3g; 0.03 absorbs the landing without
++# the tunneling that 0.05 caused on thin walls).
++TRAY_SOLREF = (0.03, 1.0)
++# Nominal tray-floor center relative to the trunk root at HOME, in the robot's
++# yaw frame (used by the reset_ball_in_tray event).
++TOSS_TRAY_OFFSET_FROM_ROOT = (0.02, 0.0, 0.1515)
++TOSS_BALL_XML: Path = _ROBOT_DIR / "toss_ball.xml"
++assert TOSS_BALL_XML.exists(), f"XML not found: {TOSS_BALL_XML}"
++
++
++TOSS_BALL_RADIUS = 0.012
++TOSS_BALL_MASS   = 0.003
++
++
++def _make_head_ball_transparent(spec: mujoco.MjSpec) -> mujoco.MjSpec:
++    """Let a contype-2 prop pass through convex head collision hulls.
++
++    The exported head meshes are convexified by MuJoCo, so the visual mouth
++    cavity is solid in collision space.  Both the physical tray task and the
++    phase-controlled beak task need the small ball to ignore those hulls while
++    the head must still collide with the floor and body.
++    """
++    jaw = next(b for b in spec.bodies if b.name == "jaw_soft")
++    _hull_i = 0
++    for g in jaw.geoms:
++        if g.classname and g.classname.name == "collision":
++            if not g.name:
++                g.name = f"head_hull_{_hull_i}_collision"
++                _hull_i += 1
++            g.contype = 4
++            g.conaffinity = 1
++    return spec
++
++
++# The exported robot has no mouth articulation: ``jaw`` and
++# ``bottom_head_shell`` are welded to ``jaw_soft`` even though the real Alpha
++# has a dedicated XL330 mouth servo (ID 34).  Its measured controller contract
++# is -5 degrees closed to +30 degrees fully open (microduck/duck-control,
++# model.rs).  BeakThrow restores that one missing hinge.  The axis passes
++# through the mouth-servo centre exported at jaw-local (0.003, +/-0.0255,
++# -0.018), so the centreline below is evidence from the CAD assembly rather
++# than a visually chosen pivot.
++#
++# A rigid sphere between two flat plates is retained only by squeeze/friction,
++# which is both numerically brittle and a poor sim-to-real assumption.  The
++# collision model therefore represents a shallow compliant liner: upper/lower
++# palate pads, a rounded front lip, a rear stop, and side cheeks.  The throat
++# behind the lip is smaller than the 24 mm ball while the mouth is at the hold
++# angle; commanding the real +30 degree limit swings the lower lip clear.  A
++# physical robot needs the corresponding molded/TPU liner if its stock bill is
++# actually flat -- the simulator must not assume invisible retention hardware.
++#
++# Prefixing the joint with ``passive_`` preserves the deployed 14-action /
++# 61-observation body-policy ABI.  A second hardware-faithful actuator group
++# drives it from the phase controller, outside the policy action vector.
++BEAK_MOUTH_JOINT = "passive_mouth_open"
++BEAK_LOWER_BODY = "beak_lower"
++BEAK_UPPER_COLLISION = "beak_upper_collision"
++BEAK_LOWER_COLLISION = "beak_lower_collision"
++BEAK_UPPER_LIP_COLLISION = "beak_upper_lip_collision"
++BEAK_LOWER_TIP_COLLISION = "beak_lower_tip_collision"
++BEAK_REAR_STOP_COLLISION = "beak_rear_stop_collision"
++BEAK_LEFT_CHEEK_COLLISION = "beak_left_cheek_collision"
++BEAK_RIGHT_CHEEK_COLLISION = "beak_right_cheek_collision"
++BEAK_CLOSED_ANGLE_RAD = math.radians(-5.0)
++BEAK_HOLD_ANGLE_RAD = math.radians(20.0)
++BEAK_OPEN_ANGLE_RAD = math.radians(30.0)
++BEAK_PIVOT_LOCAL = (0.003, 0.0, -0.018)
++BEAK_BALL_SITE_OFFSET = (-0.009, 0.0, -0.0075)
++BEAK_CONTACT_FRICTION = (1.0, 0.01, 0.001)
++BEAK_CONTACT_SOLREF = (0.012, 1.0)
++
++
++def apply_beak_variant(spec: mujoco.MjSpec) -> mujoco.MjSpec:
++    """Add a collision-resolved, externally scripted mouth to the robot.
++
++    The convex exported head hulls remain transparent to the small ball because
++    they do not represent the visual mouth cavity.  Instead, two thin rubbery
++    pads provide the actual ball contacts.  The upper pad is fixed to the head;
++    the lower pad and lower-bill visual are children of a passive hinge.  The
++    ball is never welded or teleported after reset.
++    """
++    spec = _make_head_ball_transparent(spec)
++    jaw = next(b for b in spec.bodies if b.name == "jaw_soft")
++
++    # Hide the welded CAD jaw linkage and lower shell, then recreate both on
++    # the moving body.  Their original q=0 placement is preserved exactly.
++    jaw_linkage_visual = next(
++        g
++        for g in jaw.geoms
++        if g.meshname == "jaw" and g.classname and g.classname.name == "visual"
++    )
++    lower_bill_visual = next(
++        g
++        for g in jaw.geoms
++        if g.meshname == "bottom_head_shell"
++        and g.classname
++        and g.classname.name == "visual"
++    )
++    jaw_linkage_visual.group = 5  # hidden by default in MuJoCo viewers
++    lower_bill_visual.group = 5
++
++    pivot = np.asarray(BEAK_PIVOT_LOCAL, dtype=float)
++    lower = jaw.add_body(
++        name=BEAK_LOWER_BODY,
++        pos=list(BEAK_PIVOT_LOCAL),
++    )
++    lower.add_joint(
++        name=BEAK_MOUTH_JOINT,
++        type=mujoco.mjtJoint.mjJNT_HINGE,
++        axis=[0.0, 1.0, 0.0],
++        limited=True,
++        range=[BEAK_CLOSED_ANGLE_RAD, BEAK_OPEN_ANGLE_RAD],
++        damping=0.02,
++        armature=1.0e-5,
++    )
++    lower.add_geom(
++        name="beak_jaw_visual",
++        type=mujoco.mjtGeom.mjGEOM_MESH,
++        meshname="jaw",
++        material="jaw_material",
++        pos=list(np.asarray(jaw_linkage_visual.pos, dtype=float) - pivot),
++        quat=list(jaw_linkage_visual.quat),
++        group=2,
++        contype=0,
++        conaffinity=0,
++        mass=0.0,
++    )
++    lower.add_geom(
++        name="beak_lower_visual",
++        type=mujoco.mjtGeom.mjGEOM_MESH,
++        meshname="bottom_head_shell",
++        material="bottom_head_shell_material",
++        pos=list(np.asarray(lower_bill_visual.pos, dtype=float) - pivot),
++        quat=list(lower_bill_visual.quat),
++        group=2,
++        contype=0,
++        conaffinity=0,
++        mass=0.0,
++    )
++
++    # Jaw-local x is world-up and jaw-local -z is robot-forward at HOME.  The
++    # lower positions below are expressed in the CAD's q=0 frame, then shifted
++    # to the hinge body.  At the +20 degree holding angle the two palate pads
++    # touch a 24 mm ball with about 0.5 mm compliant preload.  Rounded front
++    # lips make the opening a geometric throat, while the rear stop and cheeks
++    # complete the shallow pocket without pretending the convex head hull has
++    # an interior cavity.
++    jaw.add_geom(
++        name=BEAK_UPPER_COLLISION,
++        type=mujoco.mjtGeom.mjGEOM_BOX,
++        pos=[-0.0020, 0.0, -0.0687],
++        size=[0.0015, 0.017, 0.018],
++        group=3,
++        contype=2,
++        conaffinity=3,
++        condim=6,
++        priority=1,
++        friction=list(BEAK_CONTACT_FRICTION),
++        solref=list(BEAK_CONTACT_SOLREF),
++        rgba=[0.98, 0.714, 0.004, 0.35],
++    )
++    lower.add_geom(
++        name=BEAK_LOWER_COLLISION,
++        type=mujoco.mjtGeom.mjGEOM_BOX,
++        pos=list(np.asarray((-0.010, 0.0, -0.072), dtype=float) - pivot),
++        size=[0.0015, 0.017, 0.018],
++        group=3,
++        contype=2,
++        conaffinity=3,
++        condim=6,
++        priority=1,
++        friction=list(BEAK_CONTACT_FRICTION),
++        solref=list(BEAK_CONTACT_SOLREF),
++        rgba=[0.98, 0.714, 0.004, 0.35],
++        mass=0.005,
++    )
++    jaw.add_geom(
++        name=BEAK_UPPER_LIP_COLLISION,
++        type=mujoco.mjtGeom.mjGEOM_CAPSULE,
++        fromto=[-0.007, -0.017, -0.080, -0.007, 0.017, -0.080],
++        size=[0.002, 0.0, 0.0],
++        group=2,
++        contype=2,
++        conaffinity=3,
++        condim=6,
++        priority=1,
++        friction=list(BEAK_CONTACT_FRICTION),
++        solref=list(BEAK_CONTACT_SOLREF),
++        rgba=[0.98, 0.714, 0.004, 1.0],
++    )
++    lower.add_geom(
++        name=BEAK_LOWER_TIP_COLLISION,
++        type=mujoco.mjtGeom.mjGEOM_CAPSULE,
++        fromto=[-0.007, -0.017, -0.066, -0.007, 0.017, -0.066],
++        size=[0.002, 0.0, 0.0],
++        group=2,
++        contype=2,
++        conaffinity=3,
++        condim=6,
++        priority=1,
++        friction=list(BEAK_CONTACT_FRICTION),
++        solref=list(BEAK_CONTACT_SOLREF),
++        rgba=[0.98, 0.714, 0.004, 1.0],
++        mass=0.0002,
++    )
++    jaw.add_geom(
++        name=BEAK_REAR_STOP_COLLISION,
++        type=mujoco.mjtGeom.mjGEOM_BOX,
++        pos=[-0.0155, 0.0, -0.0545],
++        size=[0.013, 0.017, 0.0015],
++        group=3,
++        contype=2,
++        conaffinity=3,
++        condim=6,
++        priority=1,
++        friction=list(BEAK_CONTACT_FRICTION),
++        solref=list(BEAK_CONTACT_SOLREF),
++        rgba=[0.98, 0.714, 0.004, 0.35],
++    )
++    for name, y in (
++        (BEAK_LEFT_CHEEK_COLLISION, 0.016),
++        (BEAK_RIGHT_CHEEK_COLLISION, -0.016),
++    ):
++        jaw.add_geom(
++            name=name,
++            type=mujoco.mjtGeom.mjGEOM_BOX,
++            pos=[-0.0155, y, -0.068],
++            size=[0.013, 0.002, 0.015],
++            group=3,
++            contype=2,
++            conaffinity=3,
++            condim=6,
++            priority=1,
++            friction=list(BEAK_CONTACT_FRICTION),
++            solref=list(BEAK_CONTACT_SOLREF),
++            rgba=[0.98, 0.714, 0.004, 0.25],
++        )
++    return spec
++
++
++def apply_toss_variant(spec: mujoco.MjSpec) -> mujoco.MjSpec:
++    """Apply the toss modifications (bill tray + ball-transparent head hulls)
++    to any spec containing the jaw_soft body — the robot export or a full
++    scene wrapper (used by infer_policy's --header rehearsal scene)."""
++    spec = _make_head_ball_transparent(spec)
++    jaw = next(b for b in spec.bodies if b.name == "jaw_soft")
++    tray = jaw.add_body(name="bill_tray", pos=[0.0, 0.0, 0.0])
++    for name, pos, half in TOSS_TRAY_GEOMS:
++        g = tray.add_geom(
++            name=name,
++            type=mujoco.mjtGeom.mjGEOM_BOX,
++            pos=list(pos),
++            quat=list(TRAY_LOCAL_QUAT),
++            size=list(half),
++        )
++        g.contype = 2
++        g.conaffinity = 3   # ball (via its contype 2) + floor (conaffinity bit 1)
++        g.condim = 3
++        g.friction = [1.0, 0.005, 0.0001]
++        g.solref = list(TRAY_SOLREF)
++        g.density = 400.0   # light printed plastic — barely moves the head CoM
++        g.rgba = [1.0, 0.72, 0.11, 1.0]  # bill yellow
++    return spec
++
++
++def get_toss_spec() -> mujoco.MjSpec:
++    return apply_toss_variant(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML)))
++
++
++def get_beak_spec() -> mujoco.MjSpec:
++    return apply_beak_variant(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML)))
++
++
++def get_toss_ball_spec() -> mujoco.MjSpec:
++    return mujoco.MjSpec.from_file(str(TOSS_BALL_XML))
++
++
++MICRODUCK_SCENE_XML: Path = _ROBOT_DIR / "scene.xml"
++
++
++def _add_toss_ball(spec: mujoco.MjSpec) -> mujoco.MjSpec:
++    """Add the rehearsal ball with the same masks and mass as toss_ball.xml."""
++    b = spec.worldbody.add_body(name="toss_ball", pos=[0.3, 0.0, TOSS_BALL_RADIUS])
++    j = b.add_freejoint()
++    j.name = "ball_free"
++    g = b.add_geom(
++        name="toss_ball_geom",
++        type=mujoco.mjtGeom.mjGEOM_SPHERE,
++        size=[TOSS_BALL_RADIUS, 0.0, 0.0],
++    )
++    g.contype = 2
++    g.conaffinity = 1
++    g.density = TOSS_BALL_MASS / (4.0 / 3.0 * 3.141592653589793 * TOSS_BALL_RADIUS**3)
++    g.friction = [1.0, 0.005, 0.0001]
++    g.solref = list(TRAY_SOLREF)
++    g.rgba = [1.0, 0.3, 0.1, 1.0]
++    return spec
++
++
++def build_toss_scene_spec() -> mujoco.MjSpec:
++    """Full plain-MuJoCo rehearsal scene for the physical tray task."""
++    spec = apply_toss_variant(mujoco.MjSpec.from_file(str(MICRODUCK_SCENE_XML)))
++    return _add_toss_ball(spec)
++
++
++def build_beak_scene_spec() -> mujoco.MjSpec:
++    """Full plain-MuJoCo rehearsal scene for phase-controlled beak release.
++
++    Mjlab training adds a BAM voltage-model actuator through the entity config.
++    Plain MuJoCo has no manager layer, so this rehearsal scene adds the closest
++    native approximation: the measured 200-firmware-kp position stiffness,
++    damping/friction, and XL330 current-derived torque limit used by the other
++    exported joints.  It is appended after the 14 body actuators and remains
++    outside the neural policy mapping.
++    """
++    spec = apply_beak_variant(mujoco.MjSpec.from_file(str(MICRODUCK_SCENE_XML)))
++    spec = _add_toss_ball(spec)
++    create_position_actuator(
++        spec,
++        BEAK_MOUTH_JOINT,
++        stiffness=0.55,
++        damping=0.053,
++        effort_limit=0.96,
++        armature=0.0018,
++        frictionloss=0.0048,
++    )
++    return spec
++
++
+ def get_walk_backlash_spec() -> mujoco.MjSpec:
+     return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_BACKLASH_XML))
+ 
+@@ -96,6 +476,18 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
+     joint_vel={".*": 0.0},
+ )
+ 
++# BeakThrow keeps the body at the canonical HOME frame but initializes the
++# restored hardware mouth joint around the 24 mm ball.  The mouth joint name is
++# passive only with respect to the 14-action neural policy; a dedicated XL330
++# actuator below still drives it.
++BEAK_HOME_FRAME = EntityCfg.InitialStateCfg(
++    joint_pos={
++        rf"^{BEAK_MOUTH_JOINT}$": BEAK_HOLD_ANGLE_RAD,
++        **HOME_FRAME.joint_pos,
++    },
++    joint_vel={".*": 0.0},
++)
++
+ FULL_COLLISION = CollisionCfg(
+     geom_names_expr=[".*_collision"],
+     condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1},
+@@ -132,6 +524,16 @@ _BAM_ACTUATOR_KWARGS = dict(
+ )
+ actuators = FrictionDRBamActuatorCfg(**_BAM_ACTUATOR_KWARGS)
+ 
++# Same motor, firmware loop, voltage sag, and 3--6 physics-step command delay
++# as the body servos.  Keeping this separate lets the phase controller set the
++# real mouth target without adding a fifteenth output to model_2500's actor.
++mouth_actuator = FrictionDRBamActuatorCfg(
++    **{
++        **_BAM_ACTUATOR_KWARGS,
++        "target_names_expr": (rf"^{BEAK_MOUTH_JOINT}$",),
++    }
++)
++
+ # Same BAM actuator, but the firmware position loop reads the encoder THROUGH
+ # the passive_<joint>_backlash hinges (the real encoder is on the output side
+ # of the gear play). Only for the backlash model; the target regex already
+@@ -234,6 +636,135 @@ MICRODUCK_BALL_CFG = EntityCfg(
+     init_state=EntityCfg.InitialStateCfg(pos=(0.3, 0.0, 0.035)),
+ )
+ 
++# Toss-variant robot (Header task): allcollisions + bill tray, head hulls
++# transparent to the toss ball (see get_toss_spec block comment).
++# Toss-task collision management. First-match-wins dicts (resolve_expr):
++#  - tray: contype 2 / conaffinity 3 -> collides with the ball (contype 2) and
++#    the terrain (conaffinity bit 1), condim 3 + real friction for the flick.
++#  - head hulls: contype 4 / conaffinity 1 -> collide with terrain and trunk
++#    (self-collision sensor) but NEVER the ball ((2&1)|(4&1)=0) — without this
++#    the convex head hull ejects any ball near the bill (the original v1 bug,
++#    silently reintroduced when FULL_COLLISION clobbered the spec-level masks).
++MICRODUCK_TOSS_COLLISION = CollisionCfg(
++    geom_names_expr=[".*_collision"],
++    condim={
++        r"^(left|right)_foot_collision$": 3,
++        r"^tray_.*_collision$": 3,
++        ".*_collision": 1,
++    },
++    priority={r"^(left|right)_foot_collision$": 1},
++    friction={
++        r"^(left|right)_foot_collision$": (1.0,),
++        r"^tray_.*_collision$": (1.0,),
++    },
++    contype={
++        r"^head_hull_.*_collision$": 4,
++        r"^tray_.*_collision$": 2,
++        ".*_collision": 1,
++    },
++    conaffinity={
++        r"^tray_.*_collision$": 3,
++        ".*_collision": 1,
++    },
++    solref={r"^tray_.*_collision$": TRAY_SOLREF},
++)
++
++MICRODUCK_TOSS_ROBOT_CFG = EntityCfg(
++    spec_fn=get_toss_spec,
++    init_state=HOME_FRAME,
++    collisions=(MICRODUCK_TOSS_COLLISION,),
++    articulation=EntityArticulationInfoCfg(
++        actuators=(actuators,),
++        soft_joint_pos_limit_factor=0.9,
++    ),
++)
++
++# Beak-release robot: no tray. Explicit upper/lower contact pads retain the
++# ball in a partially open articulated mouth; ``passive_mouth_open`` is driven
++# by phase outside the 14-action policy. Head hull masks match the toss variant
++# so the visual mouth cavity's convex hull cannot spuriously eject the ball.
++MICRODUCK_BEAK_COLLISION = CollisionCfg(
++    geom_names_expr=[".*_collision"],
++    condim={
++        r"^(left|right)_foot_collision$": 3,
++        r"^beak_.*_collision$": 6,
++        ".*_collision": 1,
++    },
++    priority={
++        r"^(left|right)_foot_collision$": 1,
++        r"^beak_.*_collision$": 1,
++    },
++    friction={
++        r"^(left|right)_foot_collision$": (1.0,),
++        r"^beak_.*_collision$": BEAK_CONTACT_FRICTION,
++    },
++    contype={
++        r"^head_hull_.*_collision$": 4,
++        r"^beak_.*_collision$": 2,
++        ".*_collision": 1,
++    },
++    conaffinity={
++        r"^beak_.*_collision$": 3,
++        ".*_collision": 1,
++    },
++    solref={r"^beak_.*_collision$": BEAK_CONTACT_SOLREF},
++)
++
++MICRODUCK_BEAK_ROBOT_CFG = EntityCfg(
++    spec_fn=get_beak_spec,
++    init_state=BEAK_HOME_FRAME,
++    collisions=(MICRODUCK_BEAK_COLLISION,),
++    articulation=EntityArticulationInfoCfg(
++        actuators=(actuators, mouth_actuator),
++        soft_joint_pos_limit_factor=0.9,
++    ),
++)
++
++# Cinematic beak: the invisible latch is the ball-retention mechanism, so the
++# visible palate/lip geoms must not add an arbitrary contact impulse at the
++# handoff frame.  contype 4 / conaffinity 1 keeps beak↔terrain and beak↔robot
++# contacts while making the contype-2 toss ball transparent to the beak.  The
++# hardware-oriented BeakThrow config above remains fully collision-resolved.
++MICRODUCK_CINEMATIC_BEAK_COLLISION = CollisionCfg(
++    geom_names_expr=[".*_collision"],
++    condim={
++        r"^(left|right)_foot_collision$": 3,
++        r"^beak_.*_collision$": 6,
++        ".*_collision": 1,
++    },
++    priority={
++        r"^(left|right)_foot_collision$": 1,
++        r"^beak_.*_collision$": 1,
++    },
++    friction={
++        r"^(left|right)_foot_collision$": (1.0,),
++        r"^beak_.*_collision$": BEAK_CONTACT_FRICTION,
++    },
++    contype={
++        r"^head_hull_.*_collision$": 4,
++        r"^beak_.*_collision$": 4,
++        ".*_collision": 1,
++    },
++    conaffinity={".*_collision": 1},
++    solref={r"^beak_.*_collision$": BEAK_CONTACT_SOLREF},
++)
++
++MICRODUCK_CINEMATIC_BEAK_ROBOT_CFG = EntityCfg(
++    spec_fn=get_beak_spec,
++    init_state=BEAK_HOME_FRAME,
++    collisions=(MICRODUCK_CINEMATIC_BEAK_COLLISION,),
++    articulation=EntityArticulationInfoCfg(
++        actuators=(actuators, mouth_actuator),
++        soft_joint_pos_limit_factor=0.9,
++    ),
++)
++
++# 24mm / 3g toss ball; placed in the bill tray by reset_ball_in_tray.
++MICRODUCK_TOSS_BALL_CFG = EntityCfg(
++    spec_fn=get_toss_ball_spec,
++    init_state=EntityCfg.InitialStateCfg(pos=(0.3, 0.0, 0.012)),
++)
++
+ # Roller skate robot: the 4 passive wheel joints (passive_*wheel) have no XML
+ # actuators; the BAM cfg's target regex already excludes them, so the action
+ # space stays 14-dimensional. Uses the SAME canonical BAM actuator as every
+diff --git a/src/mjlab_microduck/tasks/__init__.py b/src/mjlab_microduck/tasks/__init__.py
+index 9e69fac..3a6b522 100644
+--- a/src/mjlab_microduck/tasks/__init__.py
++++ b/src/mjlab_microduck/tasks/__init__.py
+@@ -15,6 +15,72 @@ class MicroduckOnPolicyRunner(VelocityOnPolicyRunner):
+             alg["symmetry_cfg"] = {k: v for k, v in sym.items() if k != "_env"}
+ 
+ 
++class MicroduckCinematicOnPolicyRunner(MicroduckOnPolicyRunner):
++    """Conservative model_1250 continuation runner for the cinematic task.
++
++    A normal resume restores the old optimizer's 1e-3 learning rate and the
++    actor's roughly 0.4 action std, silently defeating the gentler cinematic
++    config.  This runner restores the networks and iteration counter but starts
++    a fresh optimizer at the configured 2e-4 and clamps exploration to 0.18.
++    It also disables random episode-age initialization because a throw is a
++    phase-locked one-shot sequence that must begin before release.
++    """
++
++    def load(self, path, load_cfg=None, strict=True, map_location=None):
++        if load_cfg is None:
++            load_cfg = {
++                "actor": True,
++                "critic": True,
++                "optimizer": False,
++                "iteration": True,
++                "rnd": False,
++            }
++        infos = super().load(path, load_cfg, strict, map_location)
++        distribution = self.alg.actor.distribution
++        if hasattr(distribution, "std_param"):
++            distribution.std_param.data.fill_(0.18)
++        elif hasattr(distribution, "log_std_param"):
++            import math
++
++            distribution.log_std_param.data.fill_(math.log(0.18))
++        return infos
++
++    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
++        return super().learn(
++            num_learning_iterations,
++            init_at_random_ep_len=False,
++        )
++
++
++class MicroduckHardwareOnPolicyRunner(MicroduckOnPolicyRunner):
++    """Resume a learned throw while resetting optimization for safe fine-tuning."""
++
++    def load(self, path, load_cfg=None, strict=True, map_location=None):
++        if load_cfg is None:
++            load_cfg = {
++                "actor": True,
++                "critic": True,
++                "optimizer": False,
++                "iteration": True,
++                "rnd": False,
++            }
++        infos = super().load(path, load_cfg, strict, map_location)
++        distribution = self.alg.actor.distribution
++        if hasattr(distribution, "std_param"):
++            distribution.std_param.data.fill_(0.12)
++        elif hasattr(distribution, "log_std_param"):
++            import math
++
++            distribution.log_std_param.data.fill_(math.log(0.12))
++        return infos
++
++    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
++        return super().learn(
++            num_learning_iterations,
++            init_at_random_ep_len=False,
++        )
++
++
+ from .microduck_velocity_env_cfg import (
+     make_microduck_velocity_env_cfg,
+     MicroduckRlCfg,
+@@ -67,6 +133,30 @@ from .microduck_roulade_env_cfg import (
+     make_microduck_roulade_env_cfg,
+     MicroduckRouladeRlCfg,
+ )
++from .microduck_flamingo_env_cfg import (
++    make_microduck_flamingo_env_cfg,
++    MicroduckFlamingoRlCfg,
++)
++from .microduck_header_env_cfg import (
++    make_microduck_header_env_cfg,
++    MicroduckHeaderRlCfg,
++)
++from .microduck_header_throw_env_cfg import (
++    make_microduck_header_throw_env_cfg,
++    MicroduckHeaderThrowRlCfg,
++)
++from .microduck_beak_throw_env_cfg import (
++    make_microduck_beak_throw_env_cfg,
++    make_microduck_beak_throw_hardware_env_cfg,
++    MicroduckBeakThrowRlCfg,
++    MicroduckBeakThrowHardwareRlCfg,
++)
++from .microduck_beak_cinematic_env_cfg import (
++    make_microduck_beak_cinematic_env_cfg,
++    make_microduck_beak_cinematic_train_env_cfg,
++    MicroduckBeakCinematicRlCfg,
++    MicroduckBeakCinematicTrainRlCfg,
++)
+ from .backlash import make_backlash_variant
+ 
+ # Standard velocity task
+@@ -120,6 +210,77 @@ register_mjlab_task(
+     runner_cls=MicroduckOnPolicyRunner,
+ )
+ 
++# Flamingo nap — balance on the left leg, right foot tucked, head-nap styling.
++# One-foot balance requires a 10-25° whole-body lean (measured); see the env
++# cfg module docstring for the physics-first design notes.
++register_mjlab_task(
++    task_id="Mjlab-Flamingo-Flat-MicroDuck",
++    env_cfg=make_microduck_flamingo_env_cfg(),
++    play_env_cfg=make_microduck_flamingo_env_cfg(play=True),
++    rl_cfg=MicroduckFlamingoRlCfg,
++    runner_cls=MicroduckOnPolicyRunner,
++)
++
++# Header — flick a ball out of the bill tray with a neck snap (toss model
++# variant: bill tray + ball-transparent head hulls). Blind actor, critic sees
++# the ball; kick-family reward recipe.
++register_mjlab_task(
++    task_id="Mjlab-Header-Flat-MicroDuck",
++    env_cfg=make_microduck_header_env_cfg(),
++    play_env_cfg=make_microduck_header_env_cfg(play=True),
++    rl_cfg=MicroduckHeaderRlCfg,
++    runner_cls=MicroduckOnPolicyRunner,
++)
++
++# HeaderThrow — throw-only companion policy (hot-swapped with Header's hold).
++register_mjlab_task(
++    task_id="Mjlab-HeaderThrow-Flat-MicroDuck",
++    env_cfg=make_microduck_header_throw_env_cfg(),
++    play_env_cfg=make_microduck_header_throw_env_cfg(play=True),
++    rl_cfg=MicroduckHeaderThrowRlCfg,
++    runner_cls=MicroduckOnPolicyRunner,
++)
++
++# BeakThrow — preferred maximum-distance throw. The mouth release is scripted
++# by the phase command; the policy controls the 14 locomotion/head joints.
++register_mjlab_task(
++    task_id="Mjlab-BeakThrow-Flat-MicroDuck",
++    env_cfg=make_microduck_beak_throw_env_cfg(),
++    play_env_cfg=make_microduck_beak_throw_env_cfg(play=True),
++    rl_cfg=MicroduckBeakThrowRlCfg,
++    runner_cls=MicroduckOnPolicyRunner,
++)
++
++# Hardware-safe continuation of the physical beak task.  The simulator and
++# robotd enforce the same anatomical target limits, and the actor is trained
++# not to depend on saturating them.
++register_mjlab_task(
++    task_id="Mjlab-BeakThrow-Hardware-MicroDuck",
++    env_cfg=make_microduck_beak_throw_hardware_env_cfg(),
++    play_env_cfg=make_microduck_beak_throw_hardware_env_cfg(play=True),
++    rl_cfg=MicroduckBeakThrowHardwareRlCfg,
++    runner_cls=MicroduckHardwareOnPolicyRunner,
++)
++
++# BeakThrow-Cinematic — simulator-first showcase using a clean invisible latch
++# until the beak opens.  The Train companion keeps the same 61-observation /
++# 14-action checkpoint ABI but uses a conservative continuation recipe.
++register_mjlab_task(
++    task_id="Mjlab-BeakThrow-Cinematic-MicroDuck",
++    env_cfg=make_microduck_beak_cinematic_env_cfg(),
++    play_env_cfg=make_microduck_beak_cinematic_env_cfg(play=True),
++    rl_cfg=MicroduckBeakCinematicRlCfg,
++    runner_cls=MicroduckOnPolicyRunner,
++)
++
++register_mjlab_task(
++    task_id="Mjlab-BeakThrow-Cinematic-Train-MicroDuck",
++    env_cfg=make_microduck_beak_cinematic_train_env_cfg(),
++    play_env_cfg=make_microduck_beak_cinematic_train_env_cfg(play=True),
++    rl_cfg=MicroduckBeakCinematicTrainRlCfg,
++    runner_cls=MicroduckCinematicOnPolicyRunner,
++)
++
+ # SitStand task — commanded sit ↔ stand in one policy, gently, head commandable
+ register_mjlab_task(
+     task_id="Mjlab-SitStand-Flat-MicroDuck",
+diff --git a/src/mjlab_microduck/tasks/mdp.py b/src/mjlab_microduck/tasks/mdp.py
+index f8dfcba..5afcaf2 100644
+--- a/src/mjlab_microduck/tasks/mdp.py
++++ b/src/mjlab_microduck/tasks/mdp.py
+@@ -74,7 +74,10 @@ print("[mdp] Patches 1-2 active: NaN-safe reward/advantage")
+ # exported metadata so policies stay consistent with the 14-dim action space.
+ # ---------------------------------------------------------------------------
+ from mjlab.rl import exporter_utils as _exporter_utils  # noqa: E402
+-from mjlab.envs.mdp.actions import JointPositionAction as _JointAction  # noqa: E402
++from mjlab.envs.mdp.actions import (  # noqa: E402
++    JointPositionAction as _JointAction,
++    JointPositionActionCfg as _JointPositionActionCfg,
++)
+ 
+ def _get_base_metadata_no_passive(env, run_path):
+     robot = env.scene["robot"]
+@@ -4988,6 +4991,15 @@ class GroundPickPhaseCommand(UniformVelocityCommand):
+         # at phase 0 from standing. Default True keeps the historical ground_pick
+         # behavior (random phase to decorrelate envs).
+         self._randomize_phase = bool(getattr(cfg, "randomize_phase", True))
++        self._initial_phase_range = tuple(getattr(cfg, "initial_phase_range", (0.0, 1.0)))
++        self._zero_phase_prob = float(getattr(cfg, "zero_phase_prob", 0.0))
++        if not (0.0 <= self._initial_phase_range[0] <= self._initial_phase_range[1] < 1.0):
++            raise ValueError(
++                "initial_phase_range must satisfy 0 <= low <= high < 1, got "
++                f"{self._initial_phase_range}"
++            )
++        if not 0.0 <= self._zero_phase_prob <= 1.0:
++            raise ValueError(f"zero_phase_prob must be in [0, 1], got {self._zero_phase_prob}")
+ 
+     @property
+     def command(self) -> torch.Tensor:
+@@ -5002,7 +5014,15 @@ class GroundPickPhaseCommand(UniformVelocityCommand):
+     def reset(self, env_ids: torch.Tensor | None) -> dict:
+         if env_ids is not None and len(env_ids) > 0:
+             if self._randomize_phase:
+-                self._gp_phase[env_ids] = torch.rand(len(env_ids), device=self.device)
++                lo, hi = self._initial_phase_range
++                self._gp_phase[env_ids] = (
++                    torch.rand(len(env_ids), device=self.device) * (hi - lo) + lo
++                )
++                if self._zero_phase_prob > 0.0:
++                    exact_zero = (
++                        torch.rand(len(env_ids), device=self.device) < self._zero_phase_prob
++                    )
++                    self._gp_phase[env_ids[exact_zero]] = 0.0
+             else:
+                 self._gp_phase[env_ids] = 0.0
+         return {}
+@@ -5024,6 +5044,11 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
+     class_type: type = GroundPickPhaseCommand
+     period: float = 4.0  # cycle length in seconds; sitstand uses 8.0
+     randomize_phase: bool = True  # False -> each episode starts at phase 0 (standing)
++    # Reverse-curriculum slice for phase-conditioned skills. Defaults to the
++    # historical full cycle; a one-shot throw can restrict starts to the
++    # pre-release portion so every reset still contains a genuine release.
++    initial_phase_range: tuple[float, float] = (0.0, 1.0)
++    zero_phase_prob: float = 0.0
+ 
+     def build(self, env: ManagerBasedRlEnv) -> "GroundPickPhaseCommand":
+         return GroundPickPhaseCommand(self, env)
+@@ -7186,3 +7211,1379 @@ def roulade_lateral_velocity_penalty(
+     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
+     asset: Entity = env.scene[asset_cfg.name]
+     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
++
++
++# ══════════════════════════════════════════════════════════════════════════════
++# FLAMINGO — one-leg balance + head tuck ("flamingo nap")
++#
++# Physics measured before design (scratchpad settle/CoM scans, 2026-08-29):
++#   - Whole-body CoM sits ~41 mm from either foot's center at STAND; joints
++#     alone (hip rolls ±0.38, head yaw counterweight) shift it only ~7 mm.
++#     One-foot balance therefore REQUIRES leaning the whole body 10-25° toward
++#     the stance foot — a verticality reward would fight the physics, so the
++#     composite below prices contacts/height/tuck and leaves trunk roll free
++#     up to a loose fallen-ceiling.
++#   - 103 statically balanced one-foot configs exist (CoM inside the ~38 mm
++#     sole patch, margins ≤ 5 mm), but NONE survive a fixed-ctrl hold: like
++#     walking, the pose is only reachable through active balance. The head
++#     (38% of body mass, fast yaw) is the balance arm — head-nap styling must
++#     stay at weight 0 until the balance skill exists (see the env curricula).
++# ══════════════════════════════════════════════════════════════════════════════
++
++
++def _sensor_has_contact(env: "ManagerBasedRlEnv", sensor_name: str) -> torch.Tensor:
++    """Float (N,) 1.0 where the named contact sensor reports any contact."""
++    sensor = env.scene.sensors[sensor_name]
++    found = sensor.data.found
++    if found.dim() > 1:
++        found = found.sum(dim=-1)
++    return (torch.nan_to_num(found, nan=0.0) > 0).float()
++
++
++def _not_fallen_mask(
++    env: "ManagerBasedRlEnv",
++    asset: Entity,
++    max_tilt_cos: float,
++    min_height: float,
++) -> torch.Tensor:
++    """Float (N,) 1.0 where trunk is above min_height and tilted less than the
++    ceiling (cos(tilt) > max_tilt_cos). The ceiling is LOOSE on purpose: the
++    balanced flamingo needs 10-25° of lean (measured), so gate at ~50°."""
++    quat = asset.data.root_link_quat_w
++    qx, qy = quat[:, 1], quat[:, 2]
++    upright_cos = torch.nan_to_num(1.0 - 2.0 * (qx * qx + qy * qy), nan=-1.0)
++    z = torch.nan_to_num(
++        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
++    )
++    return ((upright_cos > max_tilt_cos) & (z > min_height)).float()
++
++
++def flamingo_composite(
++    env: "ManagerBasedRlEnv",
++    stance_sensor_name: str,
++    lifted_sensor_name: str,
++    lifted_joint_indices: list,
++    tuck_overrides: dict,
++    target_height: float,
++    height_std: float = 0.04,
++    tuck_std: float = 0.5,
++    clearance_target: float = 0.03,
++    max_tilt_cos: float = 0.64,   # ≈ 50°
++    min_height: float = 0.07,
++    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
++) -> torch.Tensor:
++    """Main flamingo reward: hard single-support gate × product of Gaussians.
++
++    Gate (hard, state-based — the "what counts" per AGENTS.md): stance foot in
++    contact AND lifted foot NOT in contact AND trunk not fallen. Toe-touching
++    with the "lifted" foot pays zero by construction.
++
++    Product (each ∈ [0,1], collapses on any deficient factor):
++      - clearance: smoothstep of the lifted foot site height up to
++        ``clearance_target`` (bounded per-step → no jackpot; holding higher
++        than the target pays the same, so no incentive for violent lifts).
++      - tuck: Gaussian on the lifted-leg joints vs ``tuck_overrides``
++        (generous std — the exact fold is style, not the skill).
++      - height: Gaussian on trunk z vs ``target_height`` (blocks the
++        "crouch to the floor and hover a foot" exploit).
++
++    Trunk ROLL is deliberately unpriced (see section header): the equilibrium
++    requires leaning toward the stance foot.
++    """
++    asset: Entity = env.scene[asset_cfg.name]
++    gate = (
++        _sensor_has_contact(env, stance_sensor_name)
++        * (1.0 - _sensor_has_contact(env, lifted_sensor_name))
++        * _not_fallen_mask(env, asset, max_tilt_cos, min_height)
++    )
++
++    foot_z = torch.nan_to_num(
++        asset.data.site_pos_w[:, asset_cfg.site_ids[0], 2]
++        - env.scene.terrain.env_origins[:, 2],
++        nan=0.0,
++    )
++    x = (foot_z / clearance_target).clamp(0.0, 1.0)
++    clearance = x * x * (3.0 - 2.0 * x)  # smoothstep, saturates at target
++
++    target = _servo_default_joint_pos(env, asset).clone()
++    for idx, val in tuck_overrides.items():
++        target[:, idx] = val
++    joint_pos = _servo_joint_pos(env, asset)[:, lifted_joint_indices]
++    target = target[:, lifted_joint_indices]
++    tuck_err_sq = ((joint_pos - target) ** 2).mean(dim=-1)
++    tuck = torch.exp(-tuck_err_sq / (tuck_std * tuck_std))
++
++    z = torch.nan_to_num(
++        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
++    )
++    height = torch.exp(-(((z - target_height) / height_std) ** 2))
++
++    return gate * clearance * tuck * height
++
++
++def lifted_foot_clearance(
++    env: "ManagerBasedRlEnv",
++    stance_sensor_name: str,
++    clearance_target: float = 0.03,
++    max_tilt_cos: float = 0.64,
++    min_height: float = 0.07,
++    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
++) -> torch.Tensor:
++    """Bootstrap bridge: pays smoothstep(lifted-foot height) whenever the
++    stance foot is planted and the trunk hasn't fallen — WITHOUT requiring the
++    lifted foot to have broken contact yet. Rewards the weight shift + first
++    centimetre of lift, continuously handing over to ``flamingo_composite``
++    the moment contact breaks. Bounded per-step; gated against the "fall
++    sideways to fling the foot up" exploit by the not-fallen mask."""
++    asset: Entity = env.scene[asset_cfg.name]
++    gate = _sensor_has_contact(env, stance_sensor_name) * _not_fallen_mask(
++        env, asset, max_tilt_cos, min_height
++    )
++    foot_z = torch.nan_to_num(
++        asset.data.site_pos_w[:, asset_cfg.site_ids[0], 2]
++        - env.scene.terrain.env_origins[:, 2],
++        nan=0.0,
++    )
++    x = (foot_z / clearance_target).clamp(0.0, 1.0)
++    return gate * x * x * (3.0 - 2.0 * x)
++
++
++def flamingo_stillness(
++    env: "ManagerBasedRlEnv",
++    stance_sensor_name: str,
++    lifted_sensor_name: str,
++    vel_std: float = 2.0,
++    max_tilt_cos: float = 0.64,
++    min_height: float = 0.07,
++    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
++) -> torch.Tensor:
++    """Nap calm: Gaussian on servo joint-velocity RMS, gated on the full
++    single-support state. Introduced by curriculum AFTER the balance skill
++    exists (weight 0 at start — an attempt-tax active during discovery makes
++    "do nothing" win; see AGENTS.md). Gated on single support so it can never
++    pay for standing frozen on two feet."""
++    asset: Entity = env.scene[asset_cfg.name]
++    gate = (
++        _sensor_has_contact(env, stance_sensor_name)
++        * (1.0 - _sensor_has_contact(env, lifted_sensor_name))
++        * _not_fallen_mask(env, asset, max_tilt_cos, min_height)
++    )
++    jvel = _servo_joint_vel(env, asset)
++    rms = torch.nan_to_num(jvel, nan=0.0).pow(2).mean(dim=-1).sqrt()
++    return gate * torch.exp(-((rms / vel_std) ** 2))
++
++
++def set_flamingo_spawn(
++    env: "ManagerBasedRlEnv",
++    env_ids: torch.Tensor,
++    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
++    flamingo_prob: float = 0.5,
++    flamingo_joint_overrides: Optional[dict] = None,
++    flamingo_joint_noise_std: float = 0.06,
++    roll_range: tuple = (-0.35, -0.10),
++    pitch_max: float = 0.08,
++    standing_tilt_max: float = 0.10,
++    standing_z_min: float = 0.11,
++    standing_z_max: float = 0.12,
++    flamingo_z_min: float = 0.10,
++    flamingo_z_max: float = 0.115,
++):
++    """Reset event: standing HOME spawn or pre-balanced flamingo spawn.
++
++    The flamingo bucket is the reverse curriculum ("learns the start, never
++    the last mile" fix): episodes that BEGIN near the balanced one-foot state
++    give the hold phase on-policy data from step 0. ``roll_range`` is the
++    body-frame roll toward the stance (left, +y) foot — NEGATIVE values lean
++    left in this quaternion convention, matching the measured equilibrium
++    band (−25°…−10°). Standing spawns keep whatever ``reset_robot_joints``
++    set (HOME + its noise).
++    """
++    if env_ids is None or len(env_ids) == 0:
++        return
++    env_ids = env_ids.to(env.device, dtype=torch.int)
++    num = len(env_ids)
++
++    u = torch.rand(num, device=env.device)
++    is_flam = u < flamingo_prob
++
++    yaw = torch.rand(num, device=env.device) * 2 * np.pi - np.pi
++    # Standing: upright ± standing_tilt_max; flamingo: roll in roll_range,
++    # pitch ± pitch_max. Same ZYX intrinsic (yaw*pitch*roll) construction as
++    # set_random_ground_state.
++    roll_stand = (torch.rand(num, device=env.device) * 2 - 1) * standing_tilt_max
++    pitch_stand = (torch.rand(num, device=env.device) * 2 - 1) * standing_tilt_max
++    roll_flam = (
++        torch.rand(num, device=env.device) * (roll_range[1] - roll_range[0])
++        + roll_range[0]
++    )
++    pitch_flam = (torch.rand(num, device=env.device) * 2 - 1) * pitch_max
++    roll = torch.where(is_flam, roll_flam, roll_stand)
++    pitch = torch.where(is_flam, pitch_flam, pitch_stand)
++
++    cy, sy = torch.cos(yaw * 0.5), torch.sin(yaw * 0.5)
++    cp, sp = torch.cos(pitch * 0.5), torch.sin(pitch * 0.5)
++    cr, sr = torch.cos(roll * 0.5), torch.sin(roll * 0.5)
++    qw = cr * cp * cy + sr * sp * sy
++    qx = sr * cp * cy - cr * sp * sy
++    qy_ = cr * sp * cy + sr * cp * sy
++    qz = cr * cp * sy - sr * sp * cy
++    quat = torch.stack([qw, qx, qy_, qz], dim=1)
++
++    z_stand = (
++        torch.rand(num, device=env.device) * (standing_z_max - standing_z_min)
++        + standing_z_min
++    )
++    z_flam = (
++        torch.rand(num, device=env.device) * (flamingo_z_max - flamingo_z_min)
++        + flamingo_z_min
++    )
++    new_z = torch.where(is_flam, z_flam, z_stand)
++
++    env.sim.data.qpos[env_ids, 2] = new_z
++    env.sim.data.qpos[env_ids, 3:7] = quat
++    env.sim.data.qvel[env_ids, :6] = 0.0
++
++    asset: Entity = env.scene[asset_cfg.name]
++    servo_ids = _servo_joint_ids(env, asset)
++    flam_env_ids = env_ids[is_flam]
++    if flamingo_joint_overrides and len(flam_env_ids) > 0:
++        for jnt_idx, angle in flamingo_joint_overrides.items():
++            env.sim.data.qpos[flam_env_ids, 7 + servo_ids[jnt_idx]] = angle
++        if flamingo_joint_noise_std > 0.0:
++            cols = torch.tensor(
++                [7 + j for j in servo_ids], device=env.device, dtype=torch.long
++            )
++            noise = (
++                torch.randn(len(flam_env_ids), len(cols), device=env.device)
++                * flamingo_joint_noise_std
++            )
++            env.sim.data.qpos[flam_env_ids.unsqueeze(1).long(), cols.unsqueeze(0)] += noise
++
++
++# ══════════════════════════════════════════════════════════════════════════════
++# HEADER — flick a ball out of the bill tray (blind open-loop toss)
++#
++# Model: MICRODUCK_TOSS_ROBOT_CFG (bill tray + ball-transparent head hulls —
++# see get_toss_spec in microduck_constants.py). The ball only collides with
++# the tray, floor, trunk and legs; the ONLY way to accelerate it is through
++# the tray, i.e. by moving the bill — the contact masks are the hard gate.
++# Reward machinery reuses the BallKick family (_ball_kick_dir,
++# ball_forward_velocity, ball_speed_overshoot_penalty, ball_pos/vel_in_base).
++# ══════════════════════════════════════════════════════════════════════════════
++
++
++def reset_ball_in_tray(
++    env: ManagerBasedRlEnv,
++    env_ids: torch.Tensor,
++    offset: tuple = (0.0549, 0.0, 0.1082),
++    drop_height: float = 0.018,
++    noise_xyz: float = 0.004,
++    launched_prob: float = 0.0,
++    windup_prob: float = 0.0,
++    windup_omega: tuple = (4.0, 9.0),
++    asset_name: str = "ball",
++):
++    """Place the ball just above the bill tray; store the toss direction.
++
++    ``offset`` is the nominal tray-floor center relative to the trunk root in
++    the robot's yaw frame at HOME (TOSS_TRAY_OFFSET_FROM_ROOT). The ball spawns
++    ``drop_height`` above it and settles into the tray in the first ~0.1 s.
++    Placement DR is intentionally small (``noise_xyz``): the tray interior is
++    only ~40×22 mm — the placement variation that matters on the real robot
++    (operator drops the ball into the tray) is already this scale.
++
++    Reads the robot root from qpos directly (root_link_pos_w lags until the
++    next forward()); register AFTER set_ground_state, like reset_ball_in_front_of_foot.
++    """
++    if env_ids is None or len(env_ids) == 0:
++        return
++    env_ids = env_ids.to(env.device)
++    robot: Entity = env.scene["robot"]
++    ball: Entity = env.scene[asset_name]
++
++    root = env.sim.data.qpos[env_ids][:, robot.indexing.free_joint_q_adr]
++    qw, qx, qy, qz = root[:, 3], root[:, 4], root[:, 5], root[:, 6]
++    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
++    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
++
++    n = len(env_ids)
++    # Reverse-curriculum bucket (v7 lesson — AGENTS.md "learns the start,
++    # never the last mile"): with prob ``launched_prob`` the episode starts
++    # with the ball ALREADY mid-launch (just past the lip, flying fwd+up,
++    # latch pre-set). These episodes hand the critic on-policy evidence of the
++    # post-launch payoff (roll reward), raising the value of near-launch
++    # states — the pull the hold-attractor's risk valley otherwise blocks.
++    u = torch.rand(n, device=env.device)
++    is_launched = u < launched_prob
++    # Wind-up bucket (throw_v3 postmortem): episodes that start with the head
++    # ALREADY swinging forward — completing the launch is a one-step
++    # continuation, so on-policy launch data flows without needing noise-based
++    # exploration (which at every tested entropy either failed to launch or
++    # stripped the ball). Reverse curriculum at the ACTION level.
++    is_windup = (u >= launched_prob) & (u < launched_prob + windup_prob)
++
++    off = torch.tensor(offset, device=env.device, dtype=torch.float).repeat(n, 1)
++    off[:, 2] += drop_height
++    off += (torch.rand(n, 3, device=env.device) * 2.0 - 1.0) * noise_xyz
++    # launched bucket: ball just past the front lip, slightly above tray level
++    off[is_launched, 0] += 0.05
++    off[is_launched, 2] += 0.03
++    # windup bucket: ball seated ON the tray floor (no drop — the tray is
++    # about to accelerate away from a falling ball)
++    off[is_windup, 2] -= (drop_height - 0.002)
++
++    pose = torch.zeros(n, 7, device=env.device)
++    pose[:, 0] = root[:, 0] + cos_y * off[:, 0] - sin_y * off[:, 1]
++    pose[:, 1] = root[:, 1] + sin_y * off[:, 0] + cos_y * off[:, 1]
++    pose[:, 2] = root[:, 2] + off[:, 2]
++    pose[:, 3] = 1.0
++    ball.write_root_link_pose_to_sim(pose, env_ids)
++    vel = torch.zeros(n, 6, device=env.device)
++    launch_speed = 0.5 + torch.rand(n, device=env.device) * 0.6   # 0.5-1.1 m/s
++    vel[:, 0] = torch.where(is_launched, cos_y * launch_speed, torch.zeros_like(launch_speed))
++    vel[:, 1] = torch.where(is_launched, sin_y * launch_speed, torch.zeros_like(launch_speed))
++    vel[:, 2] = torch.where(is_launched, torch.full_like(launch_speed, 0.25), torch.zeros_like(launch_speed))
++    # windup bucket: head joints get forward angular velocity; the ball rides
++    # the tray, so seed it with the tray's approximate tangential speed
++    # (lever ~5cm from the neck pivot to the head-top tray).
++    omega = windup_omega[0] + torch.rand(n, device=env.device) * (windup_omega[1] - windup_omega[0])
++    tang = 0.05 * omega
++    vel[:, 0] = torch.where(is_windup, cos_y * tang, vel[:, 0])
++    vel[:, 1] = torch.where(is_windup, sin_y * tang, vel[:, 1])
++    ball.write_root_link_velocity_to_sim(vel, env_ids)
++    if windup_prob > 0.0:
++        wu_ids = env_ids[is_windup]
++        if len(wu_ids) > 0:
++            servo_ids = _servo_joint_ids(env, robot)
++            # neck_pitch (servo 5) and head_pitch (servo 6): forward swing.
++            # qvel column = 6 + entity joint index (free joint contributes 6).
++            for srv in (5, 6):
++                env.sim.data.qvel[wu_ids, 6 + servo_ids[srv]] = omega[is_windup]
++
++    toss_dir = _ball_kick_dir(env)
++    toss_dir[env_ids, 0] = cos_y
++    toss_dir[env_ids, 1] = sin_y
++
++    # Latch state: held-bucket episodes start un-latched with the ball held;
++    # launched-bucket episodes start latched (a legitimate launch by
++    # construction — earns roll reward immediately, but NOT the one-time
++    # bonus, which stays reserved for policy-earned launches).
++    latched, was_held = _ball_toss_state(env)
++    latched[env_ids] = False
++    latched[env_ids[is_launched]] = True
++    was_held[env_ids] = True
++    was_held[env_ids[is_launched]] = False
++    env._ball_toss_just_latched[env_ids] = False
++    env._ball_toss_latch_step[env_ids] = -1
++    # launched-bucket episodes measure any distance from their SPAWN point
++    # (the origin-measurement bug fix); they still earn no distance/arc pay
++    # (policy_earned stays False — scaffolding episodes are not achievements).
++    env._ball_toss_launch_xy[env_ids] = pose[:, :2]
++    env._ball_toss_landed[env_ids] = False
++    env._ball_toss_policy_earned[env_ids] = False
++    env._ball_toss_landed_step[env_ids] = -1
++
++
++def ball_held_reward(
++    env: ManagerBasedRlEnv,
++    asset_name: str = "ball",
++    min_rel_height: float = 0.05,
++) -> torch.Tensor:
++    """Binary: 1 while the ball rides ≥ ``min_rel_height`` above the trunk root.
++
++    Exploration aid: random early policies fling the head and drop the ball in
++    the first second, wasting the episode's toss opportunity. A small always-on
++    hold reward makes carrying the ball worth protecting. The head hulls don't
++    collide with the ball (toss model masks), so "high" can only mean "in the
++    tray" — there is no surface to farm this on except the tray itself.
++    Keep the weight SMALL relative to the toss stack: hold-forever must lose
++    to a completed toss (see the header env cfg weight rationale).
++    """
++    robot: Entity = env.scene["robot"]
++    ball: Entity = env.scene[asset_name]
++    rel_z = ball.data.root_link_pos_w[:, 2] - robot.data.root_link_pos_w[:, 2]
++    return (torch.nan_to_num(rel_z, nan=-1.0) > min_rel_height).float()
++
++
++def _ball_toss_state(env: "ManagerBasedRlEnv"):
++    """Per-env toss-latch state, lazily allocated (kick-dir pattern).
++
++    ``latched``: a legitimate launch happened this episode (ball left the held
++    state moving up and forward). ``was_held``: held-state at the previous
++    reward step, for edge detection. Reset by ``reset_ball_in_tray``.
++    """
++    if not hasattr(env, "_ball_toss_latched"):
++        env._ball_toss_latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
++        env._ball_toss_was_held = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
++        env._ball_toss_just_latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
++        env._ball_toss_latch_step = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
++        env._ball_toss_launch_xy = torch.zeros(env.num_envs, 2, device=env.device)
++        env._ball_toss_landed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
++        env._ball_toss_policy_earned = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
++        env._ball_toss_landed_step = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
++    return env._ball_toss_latched, env._ball_toss_was_held
++
++
++def ball_forward_velocity_tossed(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    max_speed: float = 1.2,
++    min_rel_height: float = 0.05,
++    min_launch_vz: float = 0.05,
++    min_launch_fwd: float = 0.1,
++) -> torch.Tensor:
++    """Ball forward velocity, gated on a LAUNCH LATCH — the anti-dump fix.
++
++    The ungated ``ball_forward_velocity`` bred the dump-hack (2026-08-30, run
++    nelovxk5 / viewer repro): the policy tips the ball off the tray in the
++    first 0.3 s and farms forward reward by pushing it with its body — ball
++    never tossed, ``ball_held`` ≈ 0. Per AGENTS.md, what counts as the
++    maneuver must be a hard state gate: here a per-env latch that opens ONLY
++    when the ball exits the held state (rel height ≥ ``min_rel_height`` above
++    the trunk) with upward (vz > ``min_launch_vz``) AND forward
++    (v·toss_dir > ``min_launch_fwd``) velocity — a flick over the lip. A dump
++    exits downward/backward, never latches, and the episode's forward reward
++    stays zero: dumping is economically dead.
++
++    This term OWNS the state update; ``ball_speed_overshoot_tossed`` reads the
++    latch only, and must be registered AFTER this term (dict order).
++    """
++    latched, was_held = _ball_toss_state(env)
++    robot: Entity = env.scene["robot"]
++    ball: Entity = env.scene[asset_name]
++
++    rel_z = ball.data.root_link_pos_w[:, 2] - robot.data.root_link_pos_w[:, 2]
++    held_now = torch.nan_to_num(rel_z, nan=-1.0) > min_rel_height
++
++    vel = torch.nan_to_num(ball.data.root_link_lin_vel_w, nan=0.0)
++    fwd = (vel[:, :2] * _ball_kick_dir(env)).sum(dim=1)
++
++    just_left = was_held & ~held_now
++    good_launch = just_left & (vel[:, 2] > min_launch_vz) & (fwd > min_launch_fwd)
++    env._ball_toss_just_latched = good_launch & ~latched
++    env._ball_toss_latch_step = torch.where(
++        env._ball_toss_just_latched, env.episode_length_buf.long(), env._ball_toss_latch_step
++    )
++    env._ball_toss_launch_xy = torch.where(
++        env._ball_toss_just_latched.unsqueeze(1),
++        ball.data.root_link_pos_w[:, :2],
++        env._ball_toss_launch_xy,
++    )
++    env._ball_toss_policy_earned |= env._ball_toss_just_latched
++    latched |= good_launch
++    was_held.copy_(held_now)
++
++    return fwd.clamp(0.0, max_speed) * latched.float()
++
++
++def ball_speed_overshoot_tossed(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    target_speed: float = 1.2,
++    max_penalty: float = 5.0,
++) -> torch.Tensor:
++    """Overshoot companion to ``ball_forward_velocity_tossed`` (reads the
++    latch, no state update — register after the forward term)."""
++    latched, _ = _ball_toss_state(env)
++    ball: Entity = env.scene[asset_name]
++    vel_xy = torch.nan_to_num(ball.data.root_link_lin_vel_w[:, :2], nan=0.0)
++    fwd = (vel_xy * _ball_kick_dir(env)).sum(dim=1)
++    return (fwd - target_speed).clamp(0.0, max_penalty) * latched.float()
++
++
++def ball_toss_launch_bonus(env: "ManagerBasedRlEnv") -> torch.Tensor:
++    """One-time discovery bonus: 1.0 on exactly the step the launch latch first
++    sets this episode, 0 otherwise. Register AFTER ball_forward_velocity_tossed
++    (which owns the state update).
++
++    WHY (header v2, run wibozuwz, iters 47-1144): with the latch honest, the
++    only ball gradient left was ball_held at ~0.06% of the episode return —
++    invisible to PPO. The policy converged to "stand nicely, ignore the ball"
++    and never explored a flick. This bonus prices the DISCOVERY itself; the
++    per-step rolling reward then prices doing it well. Once per episode and
++    bounded, so it cannot be farmed (the latch cannot re-fire)."""
++    _ball_toss_state(env)
++    return env._ball_toss_just_latched.float()
++
++
++def ball_rel_height_diag(env: "ManagerBasedRlEnv", asset_name: str = "ball") -> torch.Tensor:
++    """Diagnostic: ball height above the trunk root, clamped to [-1, 1].
++    Logged via a tiny reward weight so wandb shows where the ball actually is
++    in the GPU sim (the header v2-v4 mystery: held-fraction frozen at ~2%
++    across wildly different tray physics — consistent with the ball free-
++    falling THROUGH the tray, i.e. ball-tray contact never occurring)."""
++    robot: Entity = env.scene["robot"]
++    ball: Entity = env.scene[asset_name]
++    rel = ball.data.root_link_pos_w[:, 2] - robot.data.root_link_pos_w[:, 2]
++    return torch.nan_to_num(rel, nan=-1.0).clamp(-1.0, 1.0)
++
++
++def held_ball_forward_shaping(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    min_rel_height: float = 0.05,
++    max_speed: float = 0.3,
++) -> torch.Tensor:
++    """Discovery bridge: forward ball velocity WHILE HELD, clamped ≥ 0.
++
++    v5 lesson (run header_v5_collisionfix, iters 1800-2200): a converged hold
++    policy is an attractor that actively suppresses the exploration needed to
++    find the flick — Gaussian action noise never flings the ball over the lip
++    forward+up from a policy optimized to prevent exactly that. This term
++    builds the continuous ramp the latch/bonus can't: sweeping the held ball
++    forward pays immediately, bigger sweeps pay more, and a big enough sweep
++    IS a launch (over the front lip with fwd+up velocity → latch → bonus →
++    roll). Inert after release (held gate) and on backward motion (clamp), so
++    it cannot be farmed post-launch; pre-launch rocking is a acceptable
++    stepping stone that the bonus economics then supersede."""
++    robot: Entity = env.scene["robot"]
++    ball: Entity = env.scene[asset_name]
++    rel_z = ball.data.root_link_pos_w[:, 2] - robot.data.root_link_pos_w[:, 2]
++    held = (torch.nan_to_num(rel_z, nan=-1.0) > min_rel_height).float()
++    vel_xy = torch.nan_to_num(ball.data.root_link_lin_vel_w[:, :2], nan=0.0)
++    fwd = (vel_xy * _ball_kick_dir(env)).sum(dim=1)
++    return held * fwd.clamp(0.0, max_speed)
++
++
++def toss_complete_termination(
++    env: "ManagerBasedRlEnv",
++    settle_steps: int = 50,
++) -> torch.Tensor:
++    """Terminate ``settle_steps`` after a successful launch — "trick done".
++
++    THE decisive economics fix (throw_v5 postmortem): with full-length
++    episodes, the standing+held income stream over a surviving episode (~900)
++    dwarfs any launch jackpot, so if throwing ever risks a fall, PPO
++    rationally learns to BRAKE the throw — measured: bonus 0.1 -> 0.003
++    within ten iterations of the latch working. Ending the episode shortly
++    after the throw removes the annuity: post-launch there is nothing left to
++    earn or lose, the fall-risk asymmetry vanishes, and the jackpot plus the
++    brief roll reward is the whole comparison. Registered time_out=True (a
++    completed trick is success, not failure)."""
++    _ball_toss_state(env)
++    now = env.episode_length_buf.long()
++    ls = env._ball_toss_latch_step
++    lands = env._ball_toss_landed_step
++    # primary exit: the thrown ball touched down (plus a short grace so the
++    # terminal-step rewards register); fallback: the post-latch window, for
++    # flights that never register a clean touchdown.
++    landed_done = (lands >= 0) & (now - lands >= 10)
++    window_done = (ls >= 0) & (now - ls >= settle_steps)
++    return landed_done | window_done
++
++
++def ball_upward_velocity_tossed(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    max_vz: float = 2.0,
++) -> torch.Tensor:
++    """Post-launch UPWARD ball velocity, clamped >= 0, latch-gated.
++
++    Style term (Doug's spec: "up and forward into the air"): the forward
++    reward is z-blind, so a flat pour and a soaring arc earned identically —
++    and the pour is easier. Positive vz exists only during the ascent
++    (~0.2s), so this is bounded and unfarmable by rolling; paired with the
++    forward term the optimum is the up-and-forward arc. Register after
++    ball_forward_velocity_tossed (latch owner)."""
++    _ball_toss_state(env)
++    ball: Entity = env.scene[asset_name]
++    vz = torch.nan_to_num(ball.data.root_link_lin_vel_w[:, 2], nan=0.0)
++    return vz.clamp(0.0, max_vz) * env._ball_toss_policy_earned.float()
++
++
++def ball_landing_distance_bonus(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    ball_radius: float = 0.012,
++    max_distance: float = 3.0,
++) -> torch.Tensor:
++    """One-time bonus at the thrown ball's FIRST touchdown, proportional to
++    horizontal distance from the launch point (clamped to ``max_distance``).
++
++    Doug's spec: throw as far as possible. Landing distance is the aligned
++    objective — it prices loft, speed and whole-body power through the single
++    number that is the actual goal (max carry from a 0.28m launch wants a
++    ~40-45 deg release, which the policy now discovers rather than us
++    hand-weighting fwd-vs-up). One-shot per episode (landed flag), bounded,
++    fires only for latched (legitimate) throws. Register after the latch
++    owner."""
++    _ball_toss_state(env)
++    latched = env._ball_toss_latched
++    ball: Entity = env.scene[asset_name]
++    z = torch.nan_to_num(ball.data.root_link_pos_w[:, 2], nan=0.0)
++    touching = z < (ball_radius + 0.003)
++    just_landed = latched & touching & ~env._ball_toss_landed
++    env._ball_toss_landed |= just_landed
++    env._ball_toss_landed_step = torch.where(
++        just_landed, env.episode_length_buf.long(), env._ball_toss_landed_step
++    )
++    dist = torch.norm(
++        torch.nan_to_num(ball.data.root_link_pos_w[:, :2], nan=0.0) - env._ball_toss_launch_xy,
++        dim=1,
++    ).clamp(0.0, max_distance)
++    # scaffolding (spawn-launched) episodes record the landing for the
++    # touchdown termination but earn nothing — achievements only.
++    return dist * (just_landed & env._ball_toss_policy_earned).float()
++
++
++# ══════════════════════════════════════════════════════════════════════════════
++# BEAK THROW — physical and cinematic release, direct forward-carry objective
++#
++# The physical robot has a separately commanded mouth servo, but the training
++# articulation and hot-swap policy contract intentionally remain 14-action.
++# The physical task resolves retention and release entirely through contacts.
++# The separate cinematic task uses an explicit pre-release latch at mouth_tip,
++# then hands the ball to ordinary MuJoCo ballistics with the measured grip
++# velocity.  Keeping those paths separate prevents visual tuning from silently
++# changing the hardware-oriented task.
++# ══════════════════════════════════════════════════════════════════════════════
++
++
++def _beak_throw_state(env: "ManagerBasedRlEnv"):
++    if not hasattr(env, "_beak_released"):
++        env._beak_released = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
++        env._beak_just_released = torch.zeros(
++            env.num_envs, dtype=torch.bool, device=env.device
++        )
++        env._beak_prev_grip_pos = torch.zeros(env.num_envs, 3, device=env.device)
++        env._beak_grip_vel = torch.zeros(env.num_envs, 3, device=env.device)
++        env._beak_release_pos = torch.zeros(env.num_envs, 3, device=env.device)
++        env._beak_release_vel = torch.zeros(env.num_envs, 3, device=env.device)
++        env._beak_release_step = torch.full(
++            (env.num_envs,), -1, dtype=torch.long, device=env.device
++        )
++        env._beak_landed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
++        env._beak_just_landed = torch.zeros(
++            env.num_envs, dtype=torch.bool, device=env.device
++        )
++        env._beak_landed_step = torch.full(
++            (env.num_envs,), -1, dtype=torch.long, device=env.device
++        )
++        env._beak_predicted_range = torch.zeros(env.num_envs, device=env.device)
++        env._beak_valid_release = torch.zeros(
++            env.num_envs, dtype=torch.bool, device=env.device
++        )
++        env._beak_grip_ok = torch.ones(
++            env.num_envs, dtype=torch.bool, device=env.device
++        )
++    return env._beak_released
++
++
++class PhaseReferenceJointPositionAction(_JointAction):
++    """Residual joint action around an annealed phase-reference trajectory.
++
++    This is an exploration scaffold, not a deployment controller. It makes the
++    initial mean policy execute a real wind-up/snap so PPO receives carry data
++    immediately. The bias fades completely during training; exported ONNX
++    policies therefore contain the learned motion and need no hidden offset.
++    """
++
++    cfg: "PhaseReferenceJointPositionActionCfg"
++
++    def __init__(self, cfg, env: ManagerBasedRlEnv):
++        super().__init__(cfg, env)
++        self._env = env
++        mouth_ids, _ = self._entity.find_joints((cfg.mouth_joint_name,))
++        if len(mouth_ids) != 1:
++            raise ValueError(
++                f"expected exactly one scripted mouth joint {cfg.mouth_joint_name!r}, "
++                f"found {len(mouth_ids)}"
++            )
++        self._mouth_joint_ids = torch.tensor(
++            mouth_ids, dtype=torch.long, device=env.device
++        )
++        self._name_to_target = {name: i for i, name in enumerate(self._target_names)}
++        for pose_name, pose in (("windup_pose", cfg.windup_pose), ("release_pose", cfg.release_pose)):
++            missing = sorted(set(pose) - set(self._name_to_target))
++            if missing:
++                raise ValueError(f"{pose_name} contains unknown action joints: {missing}")
++
++    def _reference_target(self) -> torch.Tensor:
++        home = self._entity.data.default_joint_pos[:, self._target_ids]
++        windup = home.clone()
++        release = home.clone()
++        for name, value in self.cfg.windup_pose.items():
++            windup[:, self._name_to_target[name]] = value
++        for name, value in self.cfg.release_pose.items():
++            release[:, self._name_to_target[name]] = value
++
++        phase = _gp_phase(self._env, self.cfg.command_name)
++        a = (phase / self.cfg.windup_phase).clamp(0.0, 1.0).unsqueeze(1)
++        b = (
++            (phase - self.cfg.windup_phase)
++            / (self.cfg.release_phase - self.cfg.windup_phase)
++        ).clamp(0.0, 1.0).unsqueeze(1)
++        c = (
++            (phase - self.cfg.release_phase)
++            / (self.cfg.recovery_phase - self.cfg.release_phase)
++        ).clamp(0.0, 1.0).unsqueeze(1)
++        target = home + (windup - home) * a
++        target = torch.where(
++            (phase >= self.cfg.windup_phase).unsqueeze(1),
++            windup + (release - windup) * b,
++            target,
++        )
++        target = torch.where(
++            (phase >= self.cfg.release_phase).unsqueeze(1),
++            release + (home - release) * c,
++            target,
++        )
++        return torch.where(
++            (phase >= self.cfg.recovery_phase).unsqueeze(1), home, target
++        )
++
++    def process_actions(self, actions: torch.Tensor):
++        super().process_actions(actions)
++        if self.cfg.max_bias <= 0.0:
++            return
++        step = float(self._env.common_step_counter)
++        if step <= self.cfg.bias_hold_steps:
++            strength = self.cfg.max_bias
++        else:
++            fade = max(float(self.cfg.bias_fade_steps), 1.0)
++            strength = self.cfg.max_bias * max(
++                0.0, 1.0 - (step - self.cfg.bias_hold_steps) / fade
++            )
++        if strength > 0.0:
++            home = self._entity.data.default_joint_pos[:, self._target_ids]
++            self._processed_actions += strength * (self._reference_target() - home)
++
++    def apply_actions(self) -> None:
++        """Apply policy targets and drive the external mouth servo by phase.
++
++        The passive mouth joint is intentionally absent from the policy action
++        vector.  Its separately modeled XL330 receives a position target here;
++        the actuator's firmware loop, torque limit, voltage sag, and command
++        delay move the joint dynamically.  The joint state is never teleported.
++        """
++        super().apply_actions()
++        phase = _gp_phase(self._env, self.cfg.command_name)
++        opening = (
++            (phase - self.cfg.mouth_release_phase)
++            / max(float(self.cfg.mouth_open_duration_phase), 1.0e-6)
++        ).clamp(0.0, 1.0)
++        # Smoothstep avoids an impulse from teleporting the mouth linkage.
++        opening = opening * opening * (3.0 - 2.0 * opening)
++        position = (
++            self.cfg.mouth_hold_position
++            + opening
++            * (self.cfg.mouth_open_position - self.cfg.mouth_hold_position)
++        ).unsqueeze(1)
++        self._entity.set_joint_position_target(
++            position,
++            joint_ids=self._mouth_joint_ids,
++        )
++
++
++@_dataclass(kw_only=True)
++class PhaseReferenceJointPositionActionCfg(_JointPositionActionCfg):
++    class_type: type = PhaseReferenceJointPositionAction
++    command_name: str = "twist"
++    windup_phase: float = 0.25
++    release_phase: float = 0.50
++    recovery_phase: float = 0.78
++    windup_pose: dict[str, float] = None  # type: ignore[assignment]
++    release_pose: dict[str, float] = None  # type: ignore[assignment]
++    max_bias: float = 1.0
++    bias_hold_steps: int = 250 * 24
++    bias_fade_steps: int = 1250 * 24
++    mouth_joint_name: str = "passive_mouth_open"
++    mouth_release_phase: float = 0.38
++    mouth_open_duration_phase: float = 0.04
++    mouth_hold_position: float = math.radians(20.0)
++    mouth_open_position: float = math.radians(30.0)
++
++    def __post_init__(self):
++        super().__post_init__()
++        self.windup_pose = dict(self.windup_pose or {})
++        self.release_pose = dict(self.release_pose or {})
++        if not (0.0 < self.windup_phase < self.release_phase < self.recovery_phase < 1.0):
++            raise ValueError("expected 0 < windup < release < recovery < 1")
++        if not (0.0 <= self.mouth_release_phase < 1.0):
++            raise ValueError("mouth_release_phase must be in [0, 1)")
++        if self.mouth_open_duration_phase <= 0.0:
++            raise ValueError("mouth_open_duration_phase must be positive")
++        if self.mouth_open_position <= self.mouth_hold_position:
++            raise ValueError("mouth_open_position must exceed mouth_hold_position")
++
++    def build(self, env: ManagerBasedRlEnv) -> PhaseReferenceJointPositionAction:
++        return PhaseReferenceJointPositionAction(self, env)
++
++
++class CinematicBeakJointPositionAction(PhaseReferenceJointPositionAction):
++    """Body policy plus a deterministic pre-release ball grip.
++
++    The ball is placed at the configured point inside the visible beak on each
++    physics substep while the mouth is holding it.  At ``latch_release_phase``
++    the last placement gives it the finite-difference velocity of that point;
++    after that instant this class never writes the ball again.  Contacts,
++    gravity, flight and touchdown are consequently normal MuJoCo physics.
++
++    This intentionally cinematic mechanism is isolated from BeakThrow-Flat.
++    It gives an existing 14-action body policy a clean, repeatable prop handoff
++    without adding an action or observation and without pretending to model a
++    particular real gripper.
++    """
++
++    cfg: "CinematicBeakJointPositionActionCfg"
++
++    def __init__(self, cfg, env: ManagerBasedRlEnv):
++        super().__init__(cfg, env)
++        self._ball: Entity = env.scene[cfg.ball_asset_name]
++        site_ids, _ = self._entity.find_sites((cfg.mouth_site_name,))
++        if len(site_ids) != 1:
++            raise ValueError(
++                f"expected exactly one cinematic grip site {cfg.mouth_site_name!r}, "
++                f"found {len(site_ids)}"
++            )
++        self._mouth_site_id = int(site_ids[0])
++        self._grip_local_offset = torch.tensor(
++            cfg.local_grip_offset, dtype=torch.float, device=env.device
++        )
++        _beak_throw_state(env)
++
++    def process_actions(self, actions: torch.Tensor):
++        # This flag must survive all decimation substeps so the reward manager
++        # observes a release exactly once at the end of the environment step.
++        _beak_throw_state(self._env)
++        self._env._beak_just_released.zero_()
++        super().process_actions(actions)
++
++    def apply_actions(self) -> None:
++        super().apply_actions()
++        env = self._env
++        _beak_throw_state(env)
++
++        site_pos = torch.nan_to_num(
++            self._entity.data.site_pos_w[:, self._mouth_site_id, :], nan=0.0
++        )
++        site_quat = torch.nan_to_num(
++            self._entity.data.site_quat_w[:, self._mouth_site_id, :], nan=0.0
++        )
++        local = self._grip_local_offset.to(dtype=site_pos.dtype).expand(
++            env.num_envs, -1
++        )
++        grip_pos = site_pos + quat_apply(site_quat, local)
++        grip_vel = (grip_pos - env._beak_prev_grip_pos) / max(
++            float(env.physics_dt), 1.0e-6
++        )
++        # The first control step after any reset has no valid previous sample.
++        grip_vel = torch.where(
++            (env.episode_length_buf == 0).unsqueeze(1),
++            torch.zeros_like(grip_vel),
++            grip_vel,
++        )
++        grip_vel = torch.nan_to_num(grip_vel, nan=0.0).clamp(
++            -self.cfg.max_release_speed, self.cfg.max_release_speed
++        )
++        env._beak_grip_vel.copy_(grip_vel)
++
++        phase = _gp_phase(env, self.cfg.command_name)
++        unreleased = ~env._beak_released
++        releasing = unreleased & (phase >= self.cfg.latch_release_phase)
++        attached = unreleased
++        attached_ids = attached.nonzero(as_tuple=False).squeeze(-1)
++        if len(attached_ids) > 0:
++            n = len(attached_ids)
++            pose = torch.zeros(n, 7, dtype=grip_pos.dtype, device=env.device)
++            pose[:, :3] = grip_pos[attached_ids]
++            pose[:, 3] = 1.0
++            velocity = torch.zeros(n, 6, dtype=grip_pos.dtype, device=env.device)
++            velocity[:, :3] = grip_vel[attached_ids]
++            self._ball.write_root_link_pose_to_sim(pose, env_ids=attached_ids)
++            self._ball.write_root_link_velocity_to_sim(
++                velocity, env_ids=attached_ids
++            )
++
++        env._beak_just_released |= releasing
++        env._beak_release_pos = torch.where(
++            releasing.unsqueeze(1), grip_pos, env._beak_release_pos
++        )
++        env._beak_release_vel = torch.where(
++            releasing.unsqueeze(1), grip_vel, env._beak_release_vel
++        )
++        env._beak_release_step = torch.where(
++            releasing, env.episode_length_buf.long(), env._beak_release_step
++        )
++        env._beak_valid_release |= releasing
++        env._beak_released |= releasing
++        env._beak_prev_grip_pos.copy_(grip_pos)
++
++
++@_dataclass(kw_only=True)
++class CinematicBeakJointPositionActionCfg(PhaseReferenceJointPositionActionCfg):
++    class_type: type = CinematicBeakJointPositionAction
++    ball_asset_name: str = "ball"
++    mouth_site_name: str = "mouth_tip"
++    local_grip_offset: tuple[float, float, float] = (-0.009, 0.0, -0.0075)
++    latch_release_phase: float = 0.38
++    max_release_speed: float = 12.0
++
++    def __post_init__(self):
++        super().__post_init__()
++        if not (0.0 < self.latch_release_phase < 1.0):
++            raise ValueError("latch_release_phase must be in (0, 1)")
++        if self.mouth_release_phase > self.latch_release_phase:
++            raise ValueError("the mouth must begin opening no later than latch release")
++        if self.max_release_speed <= 0.0:
++            raise ValueError("max_release_speed must be positive")
++
++    def build(self, env: ManagerBasedRlEnv) -> CinematicBeakJointPositionAction:
++        return CinematicBeakJointPositionAction(self, env)
++
++
++def reset_ball_at_beak(
++    env: ManagerBasedRlEnv,
++    env_ids: torch.Tensor,
++    offset: tuple[float, float, float] = (0.0597, 0.0, 0.0971),
++    noise_xyz: float = 0.001,
++    asset_name: str = "ball",
++) -> None:
++    """Reset the free ball inside the partially closed beak.
++
++    ``offset`` is relative to the trunk root in the reset yaw frame.  After
++    this one reset write the ball is never moved kinematically: explicit upper,
++    lower, and tip contacts retain it until the scripted mouth joint opens.
++    """
++    if env_ids is None or len(env_ids) == 0:
++        return
++    env_ids = env_ids.to(env.device)
++    robot: Entity = env.scene["robot"]
++    ball: Entity = env.scene[asset_name]
++    root = env.sim.data.qpos[env_ids][:, robot.indexing.free_joint_q_adr]
++    qw, qx, qy, qz = root[:, 3], root[:, 4], root[:, 5], root[:, 6]
++    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
++    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
++
++    n = len(env_ids)
++    off = torch.tensor(offset, device=env.device, dtype=torch.float).repeat(n, 1)
++    off += (torch.rand(n, 3, device=env.device) * 2.0 - 1.0) * noise_xyz
++    pose = torch.zeros(n, 7, device=env.device)
++    pose[:, 0] = root[:, 0] + cos_y * off[:, 0] - sin_y * off[:, 1]
++    pose[:, 1] = root[:, 1] + sin_y * off[:, 0] + cos_y * off[:, 1]
++    pose[:, 2] = root[:, 2] + off[:, 2]
++    pose[:, 3] = 1.0
++    ball.write_root_link_pose_to_sim(pose, env_ids)
++    ball.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=env.device), env_ids)
++
++    toss_dir = _ball_kick_dir(env)
++    toss_dir[env_ids, 0] = cos_y
++    toss_dir[env_ids, 1] = sin_y
++
++    _beak_throw_state(env)
++    env._beak_released[env_ids] = False
++    env._beak_just_released[env_ids] = False
++    env._beak_prev_grip_pos[env_ids] = pose[:, :3]
++    env._beak_grip_vel[env_ids] = 0.0
++    env._beak_release_pos[env_ids] = pose[:, :3]
++    env._beak_release_vel[env_ids] = 0.0
++    env._beak_release_step[env_ids] = -1
++    env._beak_landed[env_ids] = False
++    env._beak_just_landed[env_ids] = False
++    env._beak_landed_step[env_ids] = -1
++    env._beak_predicted_range[env_ids] = 0.0
++    env._beak_valid_release[env_ids] = False
++    env._beak_grip_ok[env_ids] = True
++
++
++def _vacuum_forward_range(
++    pos: torch.Tensor,
++    vel: torch.Tensor,
++    forward_dir_xy: torch.Tensor,
++    ball_radius: float,
++    max_range: float,
++    gravity: float = 9.81,
++) -> torch.Tensor:
++    """Differentiable ballistic carry estimate from a candidate release state."""
++    height = (pos[:, 2] - ball_radius).clamp(min=0.0)
++    vz = vel[:, 2]
++    flight_s = (vz + torch.sqrt((vz * vz + 2.0 * gravity * height).clamp(min=0.0))) / gravity
++    fwd = (vel[:, :2] * forward_dir_xy).sum(dim=1).clamp(min=0.0)
++    return (fwd * flight_s.clamp(min=0.0)).clamp(0.0, max_range)
++
++
++def _vacuum_lateral_range(
++    pos: torch.Tensor,
++    vel: torch.Tensor,
++    forward_dir_xy: torch.Tensor,
++    ball_radius: float,
++    max_range: float,
++    gravity: float = 9.81,
++) -> torch.Tensor:
++    """Differentiable absolute sideways carry from a candidate release state."""
++    height = (pos[:, 2] - ball_radius).clamp(min=0.0)
++    vz = vel[:, 2]
++    flight_s = (
++        vz + torch.sqrt((vz * vz + 2.0 * gravity * height).clamp(min=0.0))
++    ) / gravity
++    lateral_dir_xy = torch.stack(
++        (-forward_dir_xy[:, 1], forward_dir_xy[:, 0]), dim=1
++    )
++    lateral = torch.abs((vel[:, :2] * lateral_dir_xy).sum(dim=1))
++    return (lateral * flight_s.clamp(min=0.0)).clamp(0.0, max_range)
++
++
++def beak_grip_predicted_range(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    command_name: str = "twist",
++    release_phase: float = 0.50,
++    release_settle_phase: float = 0.16,
++    shaping_start_phase: float = 0.30,
++    local_grip_offset: tuple[float, float, float] = (-0.009, 0.0, -0.0075),
++    max_hold_error: float = 0.020,
++    release_distance: float = 0.020,
++    ball_radius: float = 0.012,
++    max_range: float = 3.0,
++    max_release_tilt_deg: float = 50.0,
++    min_grip_height: float = 0.15,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg(
++        "robot", site_names=("mouth_tip",)
++    ),
++) -> torch.Tensor:
++    """Physical-grip state owner plus dense ballistic-range shaping.
++
++    Register this before every other beak reward.  The ball pose and velocity
++    are read directly from simulation; this function never writes either one.
++    The mouth begins opening at ``release_phase``.  Release is captured from
++    actual physical separation (ball-to-pocket distance), not from the clock.
++    ``release_settle_phase`` is only a deadline: if the ball is still trapped
++    then, the attempt is closed out as invalid so a stuck ball cannot earn a
++    virtual throw.  A ball that escaped before opening is invalid as well.
++    """
++    _beak_throw_state(env)
++    robot: Entity = env.scene[asset_cfg.name]
++    ball: Entity = env.scene[asset_name]
++    sid = int(asset_cfg.site_ids[0])
++    site_pos = torch.nan_to_num(robot.data.site_pos_w[:, sid, :], nan=0.0)
++    site_quat = torch.nan_to_num(robot.data.site_quat_w[:, sid, :], nan=0.0)
++    local = torch.tensor(local_grip_offset, device=env.device, dtype=site_pos.dtype)
++    grip_pos = site_pos + quat_apply(site_quat, local.expand(env.num_envs, -1))
++    ball_pos = torch.nan_to_num(ball.data.root_link_pos_w, nan=0.0)
++    ball_vel = torch.nan_to_num(ball.data.root_link_lin_vel_w, nan=0.0).clamp(-10.0, 10.0)
++    env._beak_grip_vel.copy_(ball_vel)
++
++    phase = _gp_phase(env, command_name)
++    unreleased = ~env._beak_released
++    grip_error = torch.linalg.vector_norm(ball_pos - grip_pos, dim=1)
++    before_open = unreleased & (phase < release_phase)
++    env._beak_grip_ok &= ~(before_open & (grip_error > max_hold_error))
++    mouth_commanded_open = phase >= release_phase
++    physically_separated = grip_error > release_distance
++    release_deadline = phase >= release_phase + release_settle_phase
++    stuck_at_deadline = unreleased & release_deadline & ~physically_separated
++    env._beak_grip_ok &= ~stuck_at_deadline
++    releasing = unreleased & mouth_commanded_open & (
++        physically_separated | release_deadline
++    )
++
++    env._beak_just_released.copy_(releasing)
++    env._beak_release_pos = torch.where(
++        releasing.unsqueeze(1), ball_pos, env._beak_release_pos
++    )
++    env._beak_release_vel = torch.where(
++        releasing.unsqueeze(1), ball_vel, env._beak_release_vel
++    )
++    env._beak_release_step = torch.where(
++        releasing, env.episode_length_buf.long(), env._beak_release_step
++    )
++    env._beak_released |= releasing
++    env._beak_prev_grip_pos.copy_(grip_pos)
++
++    quat = robot.data.root_link_quat_w
++    cos_tilt = torch.nan_to_num(
++        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
++    )
++    rel_height = ball_pos[:, 2] - env.scene.terrain.env_origins[:, 2]
++    valid_pose = (cos_tilt > math.cos(math.radians(max_release_tilt_deg))) & (
++        rel_height > min_grip_height
++    ) & env._beak_grip_ok
++    env._beak_valid_release = torch.where(
++        releasing, valid_pose, env._beak_valid_release
++    )
++
++    predicted = _vacuum_forward_range(
++        ball_pos, ball_vel, _ball_kick_dir(env), ball_radius, max_range
++    )
++    env._beak_predicted_range.copy_(predicted)
++    in_window = (
++        (phase >= shaping_start_phase)
++        & (phase <= release_phase + release_settle_phase)
++        & ~env._beak_released
++    )
++    return predicted * in_window.float() * valid_pose.float()
++
++
++def cinematic_beak_predicted_range(
++    env: "ManagerBasedRlEnv",
++    command_name: str = "twist",
++    release_phase: float = 0.38,
++    shaping_start_phase: float = 0.28,
++    ball_radius: float = 0.012,
++    max_range: float = 3.0,
++) -> torch.Tensor:
++    """Dense range estimate for the cinematic latch/release action.
++
++    The action term owns the state transition.  This reward only reads the
++    measured grip velocity before release and the captured release state after
++    release, avoiding a second and potentially contradictory release detector.
++    Register it before the one-shot release rewards so ``_beak_predicted_range``
++    is current when they run.
++    """
++    _beak_throw_state(env)
++    ball: Entity = env.scene["ball"]
++    phase = _gp_phase(env, command_name)
++    pos = torch.where(
++        env._beak_released.unsqueeze(1),
++        env._beak_release_pos,
++        torch.nan_to_num(ball.data.root_link_pos_w, nan=0.0),
++    )
++    vel = torch.where(
++        env._beak_released.unsqueeze(1),
++        env._beak_release_vel,
++        env._beak_grip_vel,
++    )
++    predicted = _vacuum_forward_range(
++        pos, vel, _ball_kick_dir(env), ball_radius, max_range
++    )
++    env._beak_predicted_range.copy_(predicted)
++    in_window = (
++        (phase >= shaping_start_phase)
++        & (phase <= release_phase)
++        & ~env._beak_released
++    )
++    return predicted * in_window.float()
++
++
++def beak_release_range_bonus(env: "ManagerBasedRlEnv") -> torch.Tensor:
++    """One-time ballistic-range estimate at the scripted mouth-open instant."""
++    _beak_throw_state(env)
++    return (
++        env._beak_predicted_range
++        * env._beak_just_released.float()
++        * env._beak_valid_release.float()
++    )
++
++
++def beak_release_forward_velocity(env: "ManagerBasedRlEnv", max_speed: float = 5.0) -> torch.Tensor:
++    """Diagnostic/shaping channel: forward release speed, one-time."""
++    _beak_throw_state(env)
++    fwd = (env._beak_release_vel[:, :2] * _ball_kick_dir(env)).sum(dim=1)
++    return (
++        fwd.clamp(0.0, max_speed)
++        * env._beak_just_released.float()
++        * env._beak_valid_release.float()
++    )
++
++
++def beak_release_upward_velocity(env: "ManagerBasedRlEnv", max_speed: float = 5.0) -> torch.Tensor:
++    """Diagnostic channel: upward release speed, one-time."""
++    _beak_throw_state(env)
++    return (
++        env._beak_release_vel[:, 2].clamp(0.0, max_speed)
++        * env._beak_just_released.float()
++        * env._beak_valid_release.float()
++    )
++
++
++def beak_grip_predicted_lateral_range(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    command_name: str = "twist",
++    release_phase: float = 0.30,
++    release_settle_phase: float = 0.16,
++    shaping_start_phase: float = 0.24,
++    ball_radius: float = 0.012,
++    max_range: float = 1.0,
++) -> torch.Tensor:
++    """Dense body-heading-relative sideways-flight cost before release.
++
++    The landing miss is delayed by the full ballistic flight and gave PPO weak
++    credit for which pre-release action caused it.  This term prices the
++    candidate lateral carry every control step around the snap, using the same
++    ballistic time-of-flight model as the forward-range reward.  It is zero
++    after release; the one-shot release and touchdown terms own those states.
++    """
++    _beak_throw_state(env)
++    ball: Entity = env.scene[asset_name]
++    phase = _gp_phase(env, command_name)
++    pos = torch.nan_to_num(ball.data.root_link_pos_w, nan=0.0)
++    vel = torch.nan_to_num(ball.data.root_link_lin_vel_w, nan=0.0).clamp(-10.0, 10.0)
++    predicted = _vacuum_lateral_range(
++        pos,
++        vel,
++        _ball_kick_dir(env),
++        ball_radius,
++        max_range,
++    )
++    in_window = (
++        (phase >= shaping_start_phase)
++        & (phase <= release_phase + release_settle_phase)
++        & ~env._beak_released
++        & env._beak_grip_ok
++    )
++    return predicted * in_window.float()
++
++
++def beak_release_lateral_velocity(
++    env: "ManagerBasedRlEnv", max_speed: float = 5.0
++) -> torch.Tensor:
++    """Absolute body-heading-relative sideways speed, paid once at release."""
++    _beak_throw_state(env)
++    forward = _ball_kick_dir(env)
++    lateral_axis = torch.stack((-forward[:, 1], forward[:, 0]), dim=1)
++    lateral = torch.abs((env._beak_release_vel[:, :2] * lateral_axis).sum(dim=1))
++    return (
++        lateral.clamp(0.0, max_speed)
++        * env._beak_just_released.float()
++        * env._beak_valid_release.float()
++    )
++
++
++def beak_landing_forward_distance(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    ball_radius: float = 0.012,
++    max_distance: float = 3.0,
++) -> torch.Tensor:
++    """Actual forward carry from release to first touchdown, paid once.
++
++    Unlike the retired Header distance term, this projects onto the reset
++    heading. Sideways or backward displacement cannot masquerade as distance.
++    """
++    _beak_throw_state(env)
++    ball: Entity = env.scene[asset_name]
++    z = torch.nan_to_num(ball.data.root_link_pos_w[:, 2], nan=0.0)
++    touching = z < (ball_radius + 0.003)
++    just_landed = env._beak_released & touching & ~env._beak_landed
++    env._beak_just_landed.copy_(just_landed)
++    env._beak_landed |= just_landed
++    env._beak_landed_step = torch.where(
++        just_landed, env.episode_length_buf.long(), env._beak_landed_step
++    )
++    delta_xy = torch.nan_to_num(ball.data.root_link_pos_w[:, :2], nan=0.0) - env._beak_release_pos[:, :2]
++    forward = (delta_xy * _ball_kick_dir(env)).sum(dim=1).clamp(0.0, max_distance)
++    return forward * just_landed.float() * env._beak_valid_release.float()
++
++
++def beak_landing_lateral_distance(
++    env: "ManagerBasedRlEnv",
++    asset_name: str = "ball",
++    max_distance: float = 1.0,
++) -> torch.Tensor:
++    """Absolute sideways miss at first touchdown, paid once.
++
++    This must be registered after :func:`beak_landing_forward_distance`, which
++    owns the touchdown transition and sets ``_beak_just_landed``.
++    """
++    _beak_throw_state(env)
++    ball: Entity = env.scene[asset_name]
++    delta_xy = (
++        torch.nan_to_num(ball.data.root_link_pos_w[:, :2], nan=0.0)
++        - env._beak_release_pos[:, :2]
++    )
++    forward = _ball_kick_dir(env)
++    lateral_axis = torch.stack((-forward[:, 1], forward[:, 0]), dim=1)
++    lateral = torch.abs((delta_xy * lateral_axis).sum(dim=1)).clamp(
++        0.0, max_distance
++    )
++    return (
++        lateral
++        * env._beak_just_landed.float()
++        * env._beak_valid_release.float()
++    )
++
++
++def beak_recovery_upright_linear(
++    env: "ManagerBasedRlEnv",
++    command_name: str = "twist",
++    start_phase: float = 0.45,
++    full_phase: float = 0.70,
++    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
++) -> torch.Tensor:
++    """Linear upright signal that turns on only after the throwing snap.
++
++    The ordinary upright Gaussian has almost no gradient once the duck is near
++    horizontal, which let the hardware continuation buy distance by falling
++    after release.  ``cos(tilt)`` remains informative through a fall and becomes
++    negative when inverted.  A smooth phase gate leaves the wind-up/snap free,
++    then requires recovery before robotd's phase-1 handoff to the stand policy.
++    """
++    if not 0.0 <= start_phase < full_phase <= 1.0:
++        raise ValueError("expected 0 <= start_phase < full_phase <= 1")
++    phase = _gp_phase(env, command_name)
++    gate = ((phase - start_phase) / (full_phase - start_phase)).clamp(0.0, 1.0)
++    gate = gate * gate * (3.0 - 2.0 * gate)
++    asset: Entity = env.scene[asset_cfg.name]
++    quat = asset.data.root_link_quat_w
++    upright = 1.0 - 2.0 * (quat[:, 1].square() + quat[:, 2].square())
++    return gate * upright
++
++
++def beak_throw_complete_termination(
++    env: "ManagerBasedRlEnv",
++    landing_grace_steps: int = 2,
++    post_release_steps: int = 100,
++) -> torch.Tensor:
++    """End after touchdown, with a timeout fallback for very long flights."""
++    _beak_throw_state(env)
++    now = env.episode_length_buf.long()
++    landed = (env._beak_landed_step >= 0) & (
++        now - env._beak_landed_step >= landing_grace_steps
++    )
++    released = (env._beak_release_step >= 0) & (
++        now - env._beak_release_step >= post_release_steps
++    )
++    return landed | released
++
++
++def beak_reference_pose_track(
++    env: "ManagerBasedRlEnv",
++    command_name: str = "twist",
++    windup_phase: float = 0.25,
++    release_phase: float = 0.50,
++    recovery_phase: float = 0.78,
++    windup_pose: dict[str, float] | None = None,
++    release_pose: dict[str, float] | None = None,
++    joint_indices: tuple[int, ...] = (5, 6),
++    std: float = 0.35,
++    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
++) -> torch.Tensor:
++    """Loose phase reference for bootstrap: HOME→wind-up→snap→HOME.
++
++    Only the selected servo-view joints are tracked (neck/head by default), so
++    the legs remain free to discover a crouch, jump, or recoil strategy. The
++    reward is intended to decay by curriculum after releases become reliable.
++    """
++    if not (0.0 < windup_phase < release_phase < recovery_phase < 1.0):
++        raise ValueError("expected 0 < windup < release < recovery < 1")
++    windup_pose = windup_pose or {}
++    release_pose = release_pose or {}
++    asset: Entity = env.scene[asset_cfg.name]
++    servo_ids = _servo_joint_ids(env, asset)
++    names = [asset.joint_names[i] for i in servo_ids]
++    home = _servo_default_joint_pos(env, asset)
++    windup = home.clone()
++    release = home.clone()
++    for name, value in windup_pose.items():
++        if name not in names:
++            raise ValueError(f"unknown servo joint in windup_pose: {name}")
++        windup[:, names.index(name)] = value
++    for name, value in release_pose.items():
++        if name not in names:
++            raise ValueError(f"unknown servo joint in release_pose: {name}")
++        release[:, names.index(name)] = value
++
++    phase = _gp_phase(env, command_name)
++    a = (phase / windup_phase).clamp(0.0, 1.0).unsqueeze(1)
++    b = ((phase - windup_phase) / (release_phase - windup_phase)).clamp(0.0, 1.0).unsqueeze(1)
++    c = ((phase - release_phase) / (recovery_phase - release_phase)).clamp(0.0, 1.0).unsqueeze(1)
++    target = home + (windup - home) * a
++    target = torch.where((phase >= windup_phase).unsqueeze(1), windup + (release - windup) * b, target)
++    target = torch.where((phase >= release_phase).unsqueeze(1), release + (home - release) * c, target)
++    target = torch.where((phase >= recovery_phase).unsqueeze(1), home, target)
++
++    ids = list(joint_indices)
++    current = _servo_joint_pos(env, asset)[:, ids]
++    error = current - target[:, ids]
++    return torch.exp(-torch.mean((error / std) ** 2, dim=1))

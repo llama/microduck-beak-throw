@@ -1,0 +1,5 @@
+[policy]
+beak_throw = "/opt/robot/current/policies/beak_throw.onnx"
+beak_throw_period = 2.4
+beak_throw_action_scale = 1.0
+beak_throw_gain_ratio = 1.0

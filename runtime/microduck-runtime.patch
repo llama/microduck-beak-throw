@@ -1,0 +1,957 @@
+diff --git a/.github/workflows/_build-release.yml b/.github/workflows/_build-release.yml
+index 8647771..e0b84ab 100644
+--- a/.github/workflows/_build-release.yml
++++ b/.github/workflows/_build-release.yml
+@@ -196,6 +196,7 @@ jobs:
+             --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx" \
+             --include "policies/alpha_sitstand.onnx=policies/alpha_sitstand.onnx" \
+             --include "policies/alpha_ground_pick.onnx=policies/alpha_ground_pick.onnx" \
++            --include "policies/beak_throw.onnx=policies/beak_throw.onnx" \
+             --include "policies/ball_kick_left.onnx=policies/ball_kick_left.onnx" \
+             --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
+             --include "policies/roller.onnx=policies/roller.onnx" \
+diff --git a/.github/workflows/dev.yml b/.github/workflows/dev.yml
+index 8c724ef..e76308d 100644
+--- a/.github/workflows/dev.yml
++++ b/.github/workflows/dev.yml
+@@ -182,6 +182,7 @@ jobs:
+             --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx" \
+             --include "policies/alpha_sitstand.onnx=policies/alpha_sitstand.onnx" \
+             --include "policies/alpha_ground_pick.onnx=policies/alpha_ground_pick.onnx" \
++            --include "policies/beak_throw.onnx=policies/beak_throw.onnx" \
+             --include "policies/ball_kick_left.onnx=policies/ball_kick_left.onnx" \
+             --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
+             --include "policies/roller.onnx=policies/roller.onnx" \
+diff --git a/deploy/robotd.toml b/deploy/robotd.toml
+index 1a279f8..727c434 100644
+--- a/deploy/robotd.toml
++++ b/deploy/robotd.toml
+@@ -111,6 +111,7 @@ mode = "walk"
+ # stand       = ".../current/policies/alpha_stand.onnx"       standing + body pose
+ # sitstand    = ".../current/policies/alpha_sitstand.onnx"    sit <-> stand, posture flag
+ # ground_pick = ".../current/policies/alpha_ground_pick.onnx" A-button pick
++# beak_throw = ".../beak_throw.onnx"                       experimental robot.do beak-throw
+ # kick_left   = ".../current/policies/ball_kick_left.onnx"
+ # kick_right  = ".../current/policies/ball_kick_right.onnx"
+ # roulade     = ".../current/policies/roulade.onnx"          X-button forward roll
+@@ -144,6 +145,15 @@ mode = "walk"
+ # ground_pick_action_scale = 1.0
+ # ground_pick_gain_ratio = 1.0
+ 
++# Experimental beak throw. The policy sees `[cos(2π phase), sin(2π phase), 0]` over this
++# complete cycle. robotd holds the mouth at +20 degrees, slews it to +30 over phase
++# 0.30..0.34, and bypasses the gait target filters for this skill because it was trained
++# unfiltered. Use the trained 1.0 scale: smaller scales were explicitly evaluated and made
++# the closed-loop throw fall. Begin with an empty beak and the operator ready to disable.
++# beak_throw_period = 2.4
++# beak_throw_action_scale = 1.0
++# beak_throw_gain_ratio = 1.0
++
+ # How long a kick window stays on the kick network, seconds.
+ # kick_duration = 0.5
+ 
+diff --git a/duck-control/src/policy.rs b/duck-control/src/policy.rs
+index db5b7db..2878dbb 100644
+--- a/duck-control/src/policy.rs
++++ b/duck-control/src/policy.rs
+@@ -182,6 +182,8 @@ pub enum Net {
+     SitStand,
+     /// Phase-scripted ground pick; the twist slots carry `[cos φ, sin φ, 0]`.
+     GroundPick,
++    /// Phase-scripted beak throw; the twist slots carry `[cos φ, sin φ, 0]`.
++    BeakThrow,
+     KickLeft,
+     KickRight,
+     /// Episodic forward roll; trained with every command slot at zero, and it starts
+@@ -197,6 +199,7 @@ pub struct PolicyPaths {
+     pub stand: Option<PathBuf>,
+     pub sitstand: Option<PathBuf>,
+     pub ground_pick: Option<PathBuf>,
++    pub beak_throw: Option<PathBuf>,
+     pub kick_left: Option<PathBuf>,
+     pub kick_right: Option<PathBuf>,
+     pub roulade: Option<PathBuf>,
+@@ -212,6 +215,7 @@ pub struct Policy {
+     stand: Option<Session>,
+     sitstand: Option<Session>,
+     ground_pick: Option<Session>,
++    beak_throw: Option<Session>,
+     kick_left: Option<Session>,
+     kick_right: Option<Session>,
+     roulade: Option<Session>,
+@@ -255,6 +259,7 @@ impl Policy {
+                 stand: open_opt(&paths.stand, &zero)?,
+                 sitstand: open_opt(&paths.sitstand, &zero)?,
+                 ground_pick: open_opt(&paths.ground_pick, &zero)?,
++                beak_throw: open_opt(&paths.beak_throw, &zero)?,
+                 kick_left: open_opt(&paths.kick_left, &zero)?,
+                 kick_right: open_opt(&paths.kick_right, &zero)?,
+                 roulade: open_opt(&paths.roulade, &zero)?,
+@@ -292,6 +297,10 @@ impl Policy {
+         self.ground_pick.is_some()
+     }
+ 
++    pub fn has_beak_throw(&self) -> bool {
++        self.beak_throw.is_some()
++    }
++
+     pub fn has_roulade(&self) -> bool {
+         self.roulade.is_some()
+     }
+@@ -317,6 +326,7 @@ impl Policy {
+             Net::Stand => self.stand.as_mut(),
+             Net::SitStand => self.sitstand.as_mut(),
+             Net::GroundPick => self.ground_pick.as_mut(),
++            Net::BeakThrow => self.beak_throw.as_mut(),
+             Net::KickLeft => self.kick_left.as_mut(),
+             Net::KickRight => self.kick_right.as_mut(),
+             Net::Roulade => self.roulade.as_mut(),
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index 33224ab..489cc82 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -161,7 +161,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
+ /// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
+ /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
+ /// handshake refusal.
+-pub const API_VERSION: u32 = 16;
++pub const API_VERSION: u32 = 17;
+ 
+ /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
+ ///
+@@ -1675,6 +1675,9 @@ pub struct ThereminState {
+ pub enum Skill {
+     /// Phase-scripted pick from the ground. One shot, ~3 s.
+     GroundPick,
++    /// Synchronized phase-scripted body throw and beak release. Experimental hardware
++    /// bring-up skill; one request is one complete 2.4 s cycle.
++    BeakThrow,
+     /// Left-leg kick. One shot, half a second, blind to any ball.
+     KickLeft,
+     /// Right-leg kick.
+@@ -1796,6 +1799,8 @@ pub struct SubscribeResult {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub ground_pick: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
++    pub beak_throw: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     pub kick_left: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub kick_right: Option<String>,
+diff --git a/policies/README.md b/policies/README.md
+index a1760e6..6fccd86 100644
+--- a/policies/README.md
++++ b/policies/README.md
+@@ -33,6 +33,7 @@ names to specific training runs:
+ | `alpha_stand.onnx` | `BEST_alpha_stand_body_control.onnx` | standing + body-pose |
+ | `alpha_sitstand.onnx` | `BEST_alpha_sitstand.onnx` | sit ↔ stand (posture flag) |
+ | `alpha_ground_pick.onnx` | `alpha_ground_pick.onnx` | ground pick (phase command) |
++| `beak_throw.onnx` | `q2p/beak-hardware-straight-v3-20260901-a100`, `model_2150.pt` | experimental collision-trained beak throw |
+ | `ball_kick_left.onnx` | `ball_kick_left.onnx` | left-leg kick |
+ | `ball_kick_right.onnx` | `ball_kick_right.onnx` | right-leg kick |
+ | `roller.onnx` | `BEST_roller.onnx` | roller-mode locomotion |
+@@ -72,3 +73,27 @@ stand = "/home/radxa/my_stand.onnx"
+ Then `sudo systemctl restart robotd`. A policy that fails to load is reported through
+ `robot.health` as `policy unavailable: <reason>` while the loop keeps ticking and holding its
+ pose, so a bad file is visible without putting the robot on the floor.
++
++The beak throw is deliberately not a default capability. Opt in explicitly and invoke it
++from a cleared range. Use the policy's trained scale of 1.0: evaluation found that reducing
++the scale changes the closed-loop trajectory enough to make the duck fall; safety comes from
++the throw-specific anatomical target clamp and an empty-beak first trial, not rescaling.
++
++The selected ONNX has SHA-256
++`8638bbd29b672d84bcd426b02fa49eb6224ab57b29f5556b4003f3052bf5cecd`. It was selected
++over the final training checkpoint because a randomized throw-to-stand screen found better
++lateral accuracy and no near-flip. Its raw outputs still exceed an anatomical target limit,
++so the throw-specific runtime clamp is mandatory; this remains an experimental supervised
++test policy rather than an accepted production policy.
++
++```toml
++[policy]
++beak_throw = "/opt/robot/current/policies/beak_throw.onnx"
++beak_throw_action_scale = 1.0
++```
++
++```bash
++robotctl robot enable
++robotctl robot do beak-throw
++robotctl robot disable
++```
+diff --git a/robotctl/src/configure.rs b/robotctl/src/configure.rs
+index e8b6db5..e40ff61 100644
+--- a/robotctl/src/configure.rs
++++ b/robotctl/src/configure.rs
+@@ -194,6 +194,7 @@ impl Model {
+             "policy.stand" => path(policy.stand),
+             "policy.sitstand" => path(policy.sitstand),
+             "policy.ground_pick" => path(policy.ground_pick),
++            "policy.beak_throw" => path(policy.beak_throw),
+             "policy.kick_left" => path(policy.kick_left),
+             "policy.kick_right" => path(policy.kick_right),
+             "policy.roulade" => path(policy.roulade),
+@@ -202,6 +203,8 @@ impl Model {
+             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
+             "policy.ground_pick_period" => float(policy.ground_pick_period),
+             "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
++            "policy.beak_throw_period" => float(policy.beak_throw_period),
++            "policy.beak_throw_action_scale" => float(policy.beak_throw_action_scale),
+             "media.bitrate" => Some(params.media.bitrate_resolved().to_string()),
+             "audio.pet_detect" => Some(
+                 params
+diff --git a/robotctl/src/main.rs b/robotctl/src/main.rs
+index c7f0fc5..801822e 100644
+--- a/robotctl/src/main.rs
++++ b/robotctl/src/main.rs
+@@ -350,6 +350,18 @@ enum SystemCommand {
+ 
+ #[derive(Subcommand, Debug)]
+ enum RobotCommand {
++    /// Enable the policy and bring a limp robot to the home pose before driving.
++    Enable {
++        #[arg(long)]
++        json: bool,
++    },
++
++    /// Disable the policy and return to the home pose while keeping torque on.
++    Disable {
++        #[arg(long)]
++        json: bool,
++    },
++
+     /// Power the joints and ramp to the home pose, over about two seconds.
+     ///
+     /// **This moves every joint.** Have the robot on its stand, or hold it. Needs no policy — a
+@@ -681,6 +693,8 @@ fn bar(fraction: f64) -> String {
+ #[derive(clap::ValueEnum, Clone, Copy, Debug)]
+ enum SkillArg {
+     GroundPick,
++    /// Experimental synchronized beak throw.
++    BeakThrow,
+     KickLeft,
+     KickRight,
+     /// Sit if standing, stand if sitting.
+@@ -693,6 +707,7 @@ impl SkillArg {
+     fn as_skill(self) -> proto::Skill {
+         match self {
+             SkillArg::GroundPick => proto::Skill::GroundPick,
++            SkillArg::BeakThrow => proto::Skill::BeakThrow,
+             SkillArg::KickLeft => proto::Skill::KickLeft,
+             SkillArg::KickRight => proto::Skill::KickRight,
+             SkillArg::Sit => proto::Skill::SitToggle,
+@@ -2165,6 +2180,20 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
+     client.hello()?;
+ 
+     let (call, json) = match &command {
++        RobotCommand::Enable { json } => (
++            proto::Call::RobotEnable(proto::EnableParams {
++                on: true,
++                toggle: false,
++            }),
++            *json,
++        ),
++        RobotCommand::Disable { json } => (
++            proto::Call::RobotEnable(proto::EnableParams {
++                on: false,
++                toggle: false,
++            }),
++            *json,
++        ),
+         RobotCommand::Init { json } => (proto::Call::RobotInit, *json),
+         RobotCommand::Relax { json, .. } => (proto::Call::RobotRelax, *json),
+         RobotCommand::Do { skill, json } => (
+@@ -2232,6 +2261,12 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
+         return Err(Failure::new(exit::REFUSED, reason));
+     }
+     match command {
++        RobotCommand::Enable { .. } | RobotCommand::Disable { .. } => {
++            println!(
++                "{}",
++                outcome.reason.unwrap_or_else(|| "accepted".to_owned())
++            )
++        }
+         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
+         RobotCommand::Relax { .. } => println!("torque off"),
+         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+diff --git a/robotctl/src/monitor.rs b/robotctl/src/monitor.rs
+index 232767c..5f225dd 100644
+--- a/robotctl/src/monitor.rs
++++ b/robotctl/src/monitor.rs
+@@ -1615,6 +1615,9 @@ impl View {
+         if policy.ground_pick.is_some() {
+             skills.push("pick");
+         }
++        if policy.beak_throw.is_some() {
++            skills.push("beak-throw");
++        }
+         match (policy.kick_left.is_some(), policy.kick_right.is_some()) {
+             (true, true) => skills.push("kicks"),
+             (true, false) => skills.push("kick-left"),
+diff --git a/robotd-params/src/lib.rs b/robotd-params/src/lib.rs
+index 5aa8ba0..96178b3 100644
+--- a/robotd-params/src/lib.rs
++++ b/robotd-params/src/lib.rs
+@@ -521,6 +521,9 @@ pub struct PolicyParams {
+     pub sitstand: Option<PathBuf>,
+     /// Phase-scripted ground pick. In roller mode this slot holds the crouch.
+     pub ground_pick: Option<PathBuf>,
++    /// Phase-scripted beak throw. Disabled by default; it is an experimental hardware
++    /// bring-up capability rather than part of the ordinary release bundle.
++    pub beak_throw: Option<PathBuf>,
+     pub kick_left: Option<PathBuf>,
+     pub kick_right: Option<PathBuf>,
+     /// Episodic forward roll. Ships by default in both modes, as the prototype now does.
+@@ -547,6 +550,13 @@ pub struct PolicyParams {
+     pub ground_pick_action_scale: Option<f64>,
+     /// Gain multiplier while the ground pick runs.
+     pub ground_pick_gain_ratio: f64,
++    /// One complete beak-throw cycle, including recovery, seconds.
++    pub beak_throw_period: f64,
++    /// Action scale during the beak throw. The trained value is 1.0; hardware bring-up
++    /// starts lower and promotes only after empty-beak trials.
++    pub beak_throw_action_scale: f64,
++    /// Gain multiplier during the beak throw.
++    pub beak_throw_gain_ratio: f64,
+     /// How long a kick window stays on the kick network, seconds.
+     pub kick_duration: f64,
+     /// One roulade — one forward roll, seconds. Holding the button chains rolls; this is
+@@ -581,6 +591,7 @@ pub struct ResolvedPolicy {
+     pub stand: Option<PathBuf>,
+     pub sitstand: Option<PathBuf>,
+     pub ground_pick: Option<PathBuf>,
++    pub beak_throw: Option<PathBuf>,
+     pub kick_left: Option<PathBuf>,
+     pub kick_right: Option<PathBuf>,
+     pub roulade: Option<PathBuf>,
+@@ -593,6 +604,9 @@ pub struct ResolvedPolicy {
+     pub ground_pick_period: f64,
+     pub ground_pick_action_scale: f64,
+     pub ground_pick_gain_ratio: f64,
++    pub beak_throw_period: f64,
++    pub beak_throw_action_scale: f64,
++    pub beak_throw_gain_ratio: f64,
+     pub kick_duration: f64,
+     pub roulade_duration: f64,
+     pub roulade_action_scale: f64,
+@@ -642,6 +656,7 @@ impl PolicyParams {
+             stand: path(&self.stand, stand),
+             sitstand: path(&self.sitstand, sitstand),
+             ground_pick: path(&self.ground_pick, ground_pick),
++            beak_throw: path(&self.beak_throw, None),
+             kick_left: path(&self.kick_left, kick.then_some("ball_kick_left.onnx")),
+             kick_right: path(&self.kick_right, kick.then_some("ball_kick_right.onnx")),
+             roulade: path(&self.roulade, Some("roulade.onnx")),
+@@ -663,6 +678,9 @@ impl PolicyParams {
+                 Mode::Roller => 0.8,
+             }),
+             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
++            beak_throw_period: self.beak_throw_period,
++            beak_throw_action_scale: self.beak_throw_action_scale,
++            beak_throw_gain_ratio: self.beak_throw_gain_ratio,
+             kick_duration: self.kick_duration,
+             roulade_duration: self.roulade_duration,
+             roulade_action_scale: self.roulade_action_scale,
+@@ -740,6 +758,7 @@ impl Default for PolicyParams {
+             stand: None,
+             sitstand: None,
+             ground_pick: None,
++            beak_throw: None,
+             kick_left: None,
+             kick_right: None,
+             roulade: None,
+@@ -753,6 +772,9 @@ impl Default for PolicyParams {
+             ground_pick_period: None,
+             ground_pick_action_scale: None,
+             ground_pick_gain_ratio: 1.0,
++            beak_throw_period: 2.4,
++            beak_throw_action_scale: 1.0,
++            beak_throw_gain_ratio: 1.0,
+             kick_duration: 0.5,
+             roulade_duration: 1.0,
+             roulade_action_scale: 1.0,
+diff --git a/robotd-params/src/registry.rs b/robotd-params/src/registry.rs
+index bda0238..b3e48ae 100644
+--- a/robotd-params/src/registry.rs
++++ b/robotd-params/src/registry.rs
+@@ -138,6 +138,11 @@ pub const REGISTRY: &[Entry] = &[
+         Kind::OptionalPath,
+         "Ground-pick policy (roller: the crouch)",
+     ),
++    entry(
++        "policy.beak_throw",
++        Kind::OptionalPath,
++        "Experimental phase-scripted beak-throw policy",
++    ),
+     entry("policy.kick_left", Kind::OptionalPath, "Left-kick policy"),
+     entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
+     entry("policy.roulade", Kind::OptionalPath, "Forward-roll policy"),
+@@ -186,6 +191,21 @@ pub const REGISTRY: &[Entry] = &[
+         Kind::Float,
+         "Gain multiplier during the ground pick",
+     ),
++    entry(
++        "policy.beak_throw_period",
++        Kind::Float,
++        "One beak-throw cycle including recovery, seconds",
++    ),
++    entry(
++        "policy.beak_throw_action_scale",
++        Kind::Float,
++        "Action scale during the beak throw",
++    ),
++    entry(
++        "policy.beak_throw_gain_ratio",
++        Kind::Float,
++        "Gain multiplier during the beak throw",
++    ),
+     entry("policy.kick_duration", Kind::Float, "Kick window, seconds"),
+     entry(
+         "policy.roulade_duration",
+diff --git a/robotd/src/control.rs b/robotd/src/control.rs
+index bd258dd..ff418a7 100644
+--- a/robotd/src/control.rs
++++ b/robotd/src/control.rs
+@@ -36,12 +36,47 @@ use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
+ use duck_control::obs::{ACTION_LEN, Command, Observation};
+ use duck_control::policy::{Net, Policy, PolicyError};
+ 
++// Absolute position limits from the physical beak MJCF, in runtime joint
++// order. They are scoped to the experimental throw: applying them globally
++// would silently change the deployed walking and standing policies. The
++// hardware continuation task uses these identical limits while training.
++const BEAK_THROW_JOINT_MIN: [f64; NUM_JOINTS] = degrees([
++    -25.0, -22.0, -90.0, -90.0, -90.0, -90.0, -90.0, -170.0, -25.0, -5.0, -30.0, -22.0, -90.0,
++    -90.0, -90.0,
++]);
++const BEAK_THROW_JOINT_MAX: [f64; NUM_JOINTS] = degrees([
++    30.0, 22.0, 90.0, 90.0, 90.0, 60.0, 90.0, 170.0, 25.0, 30.0, 25.0, 22.0, 90.0, 90.0, 90.0,
++]);
++
++const fn degrees(values: [f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
++    let mut radians = [0.0; NUM_JOINTS];
++    let mut i = 0;
++    while i < NUM_JOINTS {
++        radians[i] = values[i] * std::f64::consts::PI / 180.0;
++        i += 1;
++    }
++    radians
++}
++
++fn clamp_beak_throw_targets(targets: &mut [f64; NUM_JOINTS]) {
++    for (joint, target) in targets.iter_mut().enumerate() {
++        *target = target.clamp(BEAK_THROW_JOINT_MIN[joint], BEAK_THROW_JOINT_MAX[joint]);
++    }
++}
++
+ /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
+ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
+ 
+ /// The ground pick hands back at this fraction of its cycle — the prototype's cutoff.
+ const GROUND_PICK_END_PHASE: f64 = 0.7;
+ 
++/// The beak throw's simulator/runtime contract. The body policy sees a 2.4 s phase cycle;
++/// the mouth is held at +20 degrees, then slews to its +30 degree limit over 4% of the
++/// cycle. `mouth_target` maps -5..+30 degrees to 0..1, hence 25/35 for +20 degrees.
++const BEAK_THROW_RELEASE_PHASE: f64 = 0.30;
++const BEAK_THROW_OPEN_DURATION_PHASE: f64 = 0.04;
++const BEAK_THROW_HOLD_MOUTH: f64 = 25.0 / 35.0;
++
+ /// How long the sitstand network rises (posture flag 0) before the main policy takes over.
+ /// 1 s is enough on the robot — velstand owns the tail of the rise fine.
+ const RISE_SECS: f64 = 1.0;
+@@ -91,6 +126,13 @@ pub struct SkillTuning {
+     pub ground_pick_action_scale: f64,
+     /// Gain multiplier while the pick runs.
+     pub ground_pick_gain_ratio: f64,
++    /// One complete beak-throw cycle, including recovery, seconds.
++    pub beak_throw_period: f64,
++    /// Action scale while the beak throw runs. Start below 1.0 for empty-beak bring-up;
++    /// 1.0 is the training value.
++    pub beak_throw_action_scale: f64,
++    /// Gain multiplier while the beak throw runs.
++    pub beak_throw_gain_ratio: f64,
+     /// How long a kick window stays on the kick network, seconds.
+     pub kick_duration: f64,
+     /// One roulade — one forward roll, seconds. The prototype's measured single-roll time.
+@@ -107,6 +149,9 @@ impl Default for SkillTuning {
+             ground_pick_period: 4.0,
+             ground_pick_action_scale: 1.0,
+             ground_pick_gain_ratio: 1.0,
++            beak_throw_period: 2.4,
++            beak_throw_action_scale: 1.0,
++            beak_throw_gain_ratio: 1.0,
+             kick_duration: 0.5,
+             roulade_duration: 1.0,
+             roulade_action_scale: 1.0,
+@@ -127,6 +172,9 @@ pub struct Step {
+     /// A scripted move is mid-flight — the robot is moving regardless of the twist, so
+     /// restarting the daemon now would put it on the floor.
+     pub busy: bool,
++    /// A skill-owned mouth opening fraction. The beak throw owns the mouth while active so
++    /// its release cannot race a client mouth intent, the theremin, or the chorale.
++    pub mouth: Option<f64>,
+ }
+ 
+ /// Where the robot is in the sit↔stand cycle.
+@@ -155,6 +203,8 @@ pub struct Controller {
+     previous: Option<[f64; NUM_JOINTS]>,
+     /// Ground-pick phase, 0..[`GROUND_PICK_END_PHASE`]. `None` when inactive.
+     ground_pick: Option<f64>,
++    /// Beak-throw phase, 0..1. `None` when inactive.
++    beak_throw: Option<f64>,
+     /// An active kick window: which leg, and seconds remaining.
+     kick: Option<(bool, f64)>,
+     /// An active roulade: seconds remaining in the current roll.
+@@ -175,6 +225,7 @@ impl Controller {
+             last_action: [0.0; ACTION_LEN],
+             previous: None,
+             ground_pick: None,
++            beak_throw: None,
+             kick: None,
+             roulade: None,
+             roulade_chain: 0.0,
+@@ -190,6 +241,8 @@ impl Controller {
+     pub fn reset(&mut self) {
+         self.last_action = [0.0; ACTION_LEN];
+         self.previous = None;
++        // An interrupted one-shot must never resume halfway through its snap/release.
++        self.beak_throw = None;
+     }
+ 
+     pub fn has_sitstand(&self) -> bool {
+@@ -204,6 +257,7 @@ impl Controller {
+     /// parked, not travelling.
+     pub fn busy(&self) -> bool {
+         self.ground_pick.is_some()
++            || self.beak_throw.is_some()
+             || self.kick.is_some()
+             || self.roulade.is_some()
+             || matches!(self.sit, Sit::Rising { .. })
+@@ -223,6 +277,21 @@ impl Controller {
+         Ok(())
+     }
+ 
++    /// Start one synchronized body-policy + mouth-release cycle.
++    pub fn start_beak_throw(&mut self) -> Result<(), &'static str> {
++        if !self.policy.has_beak_throw() {
++            return Err("no beak-throw policy loaded");
++        }
++        if self.busy() {
++            return Err("a scripted move is already running");
++        }
++        if self.sit != Sit::Up {
++            return Err("robot must be standing");
++        }
++        self.beak_throw = Some(0.0);
++        Ok(())
++    }
++
+     /// Start a kick window. Blocked while any scripted move runs, as the prototype blocks it.
+     pub fn start_kick(&mut self, left: bool) -> Result<(), &'static str> {
+         if !self.policy.has_kick(left) {
+@@ -333,10 +402,22 @@ impl Controller {
+         {
+             self.sit = Sit::Up;
+         }
++        if let Some(phase) = self.beak_throw
++            && phase >= 1.0
++        {
++            self.beak_throw = None;
++        }
+ 
+         // Re-encode the command for the active skill and pick the network. The priority
+         // chain is the prototype's: roulade > kick > ground pick > sit/rise > stand > walk.
+-        let (net, effective, label) = if self.roulade.is_some() {
++        let (net, effective, label) = if let Some(phase) = self.beak_throw {
++            let angle = std::f64::consts::TAU * phase;
++            let c = Command {
++                twist: [angle.cos(), angle.sin(), 0.0],
++                ..Command::default()
++            };
++            (Net::BeakThrow, c, "beak_throw")
++        } else if self.roulade.is_some() {
+             // Trained with every command slot at zero; it rolls as soon as it is switched
+             // in, so being selected IS the trigger.
+             (Net::Roulade, Command::default(), "roulade")
+@@ -403,6 +484,10 @@ impl Controller {
+             || (matches!(net, Net::KickLeft | Net::KickRight | Net::SitStand)
+                 && self.policy.will_stand(effective.twist_magnitude()));
+         let (scale, gain) = match net {
++            Net::BeakThrow => (
++                self.skills.beak_throw_action_scale,
++                (self.tuning.gain as f64 * self.skills.beak_throw_gain_ratio).round() as u16,
++            ),
+             Net::Roulade => (
+                 self.skills.roulade_action_scale,
+                 (self.tuning.gain as f64 * self.skills.roulade_gain_ratio).round() as u16,
+@@ -435,7 +520,11 @@ impl Controller {
+             targets[joint] = DEFAULT_POSITION[joint] + scale * offsets[joint];
+         }
+ 
+-        if let Some(previous) = self.previous {
++        // The beak policy was trained on raw targets. The ordinary alpha gaits were trained
++        // with these filters, but applying them to the throw delays and weakens the snap.
++        if !matches!(net, Net::BeakThrow)
++            && let Some(previous) = self.previous
++        {
+             if let Some(alpha) = self.tuning.head_lowpass {
+                 for joint in HEAD_JOINTS {
+                     targets[joint] = alpha * targets[joint] + (1.0 - alpha) * previous[joint];
+@@ -450,6 +539,9 @@ impl Controller {
+                 }
+             }
+         }
++        if matches!(net, Net::BeakThrow) {
++            clamp_beak_throw_targets(&mut targets);
++        }
+         self.previous = Some(targets);
+ 
+         // Advance the windows, after the tick that used them — the prototype advances its
+@@ -460,6 +552,10 @@ impl Controller {
+                 self.ground_pick = None;
+             }
+         }
++        let mouth = self.beak_throw.map(beak_throw_mouth);
++        if let Some(phase) = self.beak_throw.as_mut() {
++            *phase += dt / self.skills.beak_throw_period;
++        }
+         if let Some((_, remaining)) = self.kick.as_mut() {
+             *remaining -= dt;
+         }
+@@ -476,10 +572,17 @@ impl Controller {
+             label,
+             gain,
+             busy: self.busy(),
++            mouth,
+         })
+     }
+ }
+ 
++fn beak_throw_mouth(phase: f64) -> f64 {
++    let t = ((phase - BEAK_THROW_RELEASE_PHASE) / BEAK_THROW_OPEN_DURATION_PHASE).clamp(0.0, 1.0);
++    let smooth = t * t * (3.0 - 2.0 * t);
++    BEAK_THROW_HOLD_MOUTH + smooth * (1.0 - BEAK_THROW_HOLD_MOUTH)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -509,6 +612,9 @@ mod tests {
+         assert_eq!(s.ground_pick_period, 4.0);
+         assert_eq!(s.ground_pick_action_scale, 1.0);
+         assert_eq!(s.ground_pick_gain_ratio, 1.0);
++        assert_eq!(s.beak_throw_period, 2.4);
++        assert_eq!(s.beak_throw_action_scale, 1.0);
++        assert_eq!(s.beak_throw_gain_ratio, 1.0);
+         assert_eq!(s.kick_duration, 0.5);
+         assert_eq!(s.roulade_duration, 1.0, "one roll, the measured time");
+         assert_eq!(s.roulade_action_scale, 1.0);
+@@ -535,4 +641,30 @@ mod tests {
+         assert_eq!(GROUND_PICK_END_PHASE, 0.7);
+         assert_eq!(RISE_SECS, 1.0);
+     }
++
++    #[test]
++    fn beak_release_matches_the_training_phase_and_hardware_angles() {
++        assert_eq!(beak_throw_mouth(0.0), 25.0 / 35.0);
++        assert_eq!(beak_throw_mouth(BEAK_THROW_RELEASE_PHASE), 25.0 / 35.0);
++        let halfway =
++            beak_throw_mouth(BEAK_THROW_RELEASE_PHASE + BEAK_THROW_OPEN_DURATION_PHASE / 2.0);
++        assert!(
++            (halfway - (BEAK_THROW_HOLD_MOUTH + (1.0 - BEAK_THROW_HOLD_MOUTH) / 2.0)).abs() < 1e-12
++        );
++        assert_eq!(
++            beak_throw_mouth(BEAK_THROW_RELEASE_PHASE + BEAK_THROW_OPEN_DURATION_PHASE),
++            1.0
++        );
++    }
++
++    #[test]
++    fn beak_throw_targets_use_the_training_joint_envelope() {
++        let mut targets = [100.0; NUM_JOINTS];
++        clamp_beak_throw_targets(&mut targets);
++        assert_eq!(targets, BEAK_THROW_JOINT_MAX);
++
++        targets.fill(-100.0);
++        clamp_beak_throw_targets(&mut targets);
++        assert_eq!(targets, BEAK_THROW_JOINT_MIN);
++    }
+ }
+diff --git a/robotd/src/intents.rs b/robotd/src/intents.rs
+index a0c2893..81746d2 100644
+--- a/robotd/src/intents.rs
++++ b/robotd/src/intents.rs
+@@ -74,6 +74,7 @@ impl Default for PoseIntent {
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+ pub struct SkillRequests {
+     pub ground_pick: bool,
++    pub beak_throw: bool,
+     pub kick_left: bool,
+     pub kick_right: bool,
+     pub sit_toggle: bool,
+@@ -84,7 +85,12 @@ pub struct SkillRequests {
+ 
+ impl SkillRequests {
+     pub fn any(&self) -> bool {
+-        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle || self.roulade
++        self.ground_pick
++            || self.beak_throw
++            || self.kick_left
++            || self.kick_right
++            || self.sit_toggle
++            || self.roulade
+     }
+ }
+ 
+@@ -94,6 +100,7 @@ const SKILL_KICK_LEFT: u32 = 1 << 1;
+ const SKILL_KICK_RIGHT: u32 = 1 << 2;
+ const SKILL_SIT_TOGGLE: u32 = 1 << 3;
+ const SKILL_ROULADE: u32 = 1 << 4;
++const SKILL_BEAK_THROW: u32 = 1 << 5;
+ 
+ /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
+ /// (20 ms) while the trigger is down, so anything much older means the client stopped
+@@ -271,6 +278,7 @@ impl Intents {
+     pub fn request_skill(&self, skill: duck_ipc_proto::Skill) {
+         let bit = match skill {
+             duck_ipc_proto::Skill::GroundPick => SKILL_GROUND_PICK,
++            duck_ipc_proto::Skill::BeakThrow => SKILL_BEAK_THROW,
+             duck_ipc_proto::Skill::KickLeft => SKILL_KICK_LEFT,
+             duck_ipc_proto::Skill::KickRight => SKILL_KICK_RIGHT,
+             duck_ipc_proto::Skill::SitToggle => SKILL_SIT_TOGGLE,
+@@ -285,6 +293,7 @@ impl Intents {
+         let bits = self.skills.swap(0, std::sync::atomic::Ordering::Relaxed);
+         SkillRequests {
+             ground_pick: bits & SKILL_GROUND_PICK != 0,
++            beak_throw: bits & SKILL_BEAK_THROW != 0,
+             kick_left: bits & SKILL_KICK_LEFT != 0,
+             kick_right: bits & SKILL_KICK_RIGHT != 0,
+             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index aa7c46b..1e66d61 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -308,6 +308,7 @@ struct PolicyNames {
+     stand: Option<String>,
+     sitstand: Option<String>,
+     ground_pick: Option<String>,
++    beak_throw: Option<String>,
+     kick_left: Option<String>,
+     kick_right: Option<String>,
+     roulade: Option<String>,
+@@ -325,6 +326,7 @@ impl PolicyNames {
+             stand: name(&policy.stand),
+             sitstand: name(&policy.sitstand),
+             ground_pick: name(&policy.ground_pick),
++            beak_throw: name(&policy.beak_throw),
+             kick_left: name(&policy.kick_left),
+             kick_right: name(&policy.kick_right),
+             roulade: name(&policy.roulade),
+@@ -1079,6 +1081,9 @@ fn build_controller(
+             ground_pick_period: policy_cfg.ground_pick_period,
+             ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
+             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
++            beak_throw_period: policy_cfg.beak_throw_period,
++            beak_throw_action_scale: policy_cfg.beak_throw_action_scale,
++            beak_throw_gain_ratio: policy_cfg.beak_throw_gain_ratio,
+             kick_duration: policy_cfg.kick_duration,
+             roulade_duration: policy_cfg.roulade_duration,
+             roulade_action_scale: policy_cfg.roulade_action_scale,
+@@ -1089,6 +1094,7 @@ fn build_controller(
+             stand: policy_cfg.stand.clone(),
+             sitstand: policy_cfg.sitstand.clone(),
+             ground_pick: policy_cfg.ground_pick.clone(),
++            beak_throw: policy_cfg.beak_throw.clone(),
+             kick_left: policy_cfg.kick_left.clone(),
+             kick_right: policy_cfg.kick_right.clone(),
+             roulade: policy_cfg.roulade.clone(),
+@@ -1107,6 +1113,7 @@ fn build_controller(
+                     stand = ?policy_cfg.stand.as_ref().map(|p| p.display().to_string()),
+                     sitstand = ?policy_cfg.sitstand.as_ref().map(|p| p.display().to_string()),
+                     ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
++                    beak_throw = ?policy_cfg.beak_throw.as_ref().map(|p| p.display().to_string()),
+                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
+                     roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
+                     limp_fall,
+@@ -1457,6 +1464,9 @@ async fn control_loop<T: RobotIo>(
+                     if requests.ground_pick {
+                         outcome("ground_pick", controller.start_ground_pick());
+                     }
++                    if requests.beak_throw {
++                        outcome("beak_throw", controller.start_beak_throw());
++                    }
+                     if requests.kick_left {
+                         outcome("kick_left", controller.start_kick(true));
+                     }
+@@ -1933,67 +1943,72 @@ async fn control_loop<T: RobotIo>(
+             1.0
+         };
+ 
+-        let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+-            // The limp-fall sequence, before anything else — `driving` is false throughout,
+-            // so without this it would fall through to the hold branch and the robot would
+-            // be commanded its pre-fall pose at walking gain, which is precisely the thing
+-            // the mode exists to stop.
+-            //
+-            // `moving` stays true for the whole sequence: the joints are travelling (down,
+-            // then back to the pose), and `safeToRestart` must not say yes in the middle of
+-            // a fall.
+-            _ if in_limp_fall => match limp_fall {
+-                // Command the joints where they already are, at limp gain. Following the
+-                // measurement rather than holding a fixed pose is what makes it soft: a
+-                // fixed target grows an error as the robot collapses, and an error at any
+-                // gain is a motor pushing back against the floor.
+-                LimpFall::Limp { .. } => (
+-                    coast.known_positions(hold),
+-                    params.safety.gain_limp,
+-                    true,
+-                    "limp_fall",
+-                ),
+-                LimpFall::Posing { .. } => (
+-                    // Past the end of the ramp the target is the pose itself — the state
+-                    // machine above clears `Posing` on the same tick, so this is the one
+-                    // frame where the two can disagree.
+-                    limp_fall
+-                        .pose_target(tick_start, limp_fall_pose)
+-                        .unwrap_or(DEFAULT_POSITION),
+-                    params.safety.limp_fall_pose_gain,
+-                    true,
+-                    "limp_pose",
+-                ),
+-                LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
+-            },
+-            (true, Some(sensors)) => {
+-                let controller = controller.as_mut().expect("driving implies a controller");
+-                match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
+-                    Ok(step) => (
+-                        step.targets,
+-                        step.gain,
+-                        // A scripted move is motion whatever the twist says; so is walking.
+-                        step.busy || command.twist_magnitude() > 0.0,
+-                        step.label,
++        let (mut targets, gain, moving, policy_label, skill_mouth) =
++            match (driving, sensors.as_ref()) {
++                // The limp-fall sequence, before anything else — `driving` is false throughout,
++                // so without this it would fall through to the hold branch and the robot would
++                // be commanded its pre-fall pose at walking gain, which is precisely the thing
++                // the mode exists to stop.
++                //
++                // `moving` stays true for the whole sequence: the joints are travelling (down,
++                // then back to the pose), and `safeToRestart` must not say yes in the middle of
++                // a fall.
++                _ if in_limp_fall => match limp_fall {
++                    // Command the joints where they already are, at limp gain. Following the
++                    // measurement rather than holding a fixed pose is what makes it soft: a
++                    // fixed target grows an error as the robot collapses, and an error at any
++                    // gain is a motor pushing back against the floor.
++                    LimpFall::Limp { .. } => (
++                        coast.known_positions(hold),
++                        params.safety.gain_limp,
++                        true,
++                        "limp_fall",
++                        None,
++                    ),
++                    LimpFall::Posing { .. } => (
++                        // Past the end of the ramp the target is the pose itself — the state
++                        // machine above clears `Posing` on the same tick, so this is the one
++                        // frame where the two can disagree.
++                        limp_fall
++                            .pose_target(tick_start, limp_fall_pose)
++                            .unwrap_or(DEFAULT_POSITION),
++                        params.safety.limp_fall_pose_gain,
++                        true,
++                        "limp_pose",
++                        None,
+                     ),
+-                    Err(e) => {
+-                        tracing::warn!(error = %e, "inference failed; holding");
+-                        (hold, policy_cfg.gain, false, "held")
++                    LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
++                },
++                (true, Some(sensors)) => {
++                    let controller = controller.as_mut().expect("driving implies a controller");
++                    match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
++                        Ok(step) => (
++                            step.targets,
++                            step.gain,
++                            // A scripted move is motion whatever the twist says; so is walking.
++                            step.busy || command.twist_magnitude() > 0.0,
++                            step.label,
++                            step.mouth,
++                        ),
++                        Err(e) => {
++                            tracing::warn!(error = %e, "inference failed; holding");
++                            (hold, policy_cfg.gain, false, "held", None)
++                        }
+                     }
+                 }
+-            }
+-            // Ramping to the home pose. `moving` is true, because it is: the joints are travelling,
+-            // and `safeToRestart` must not say yes in the middle of it.
+-            _ if bringup.homing_target(tick_start).is_some() => (
+-                bringup
+-                    .homing_target(tick_start)
+-                    .expect("just checked it is Some"),
+-                policy_cfg.gain,
+-                true,
+-                "homing",
+-            ),
+-            _ => (hold, policy_cfg.gain, false, "held"),
+-        };
++                // Ramping to the home pose. `moving` is true, because it is: the joints are travelling,
++                // and `safeToRestart` must not say yes in the middle of it.
++                _ if bringup.homing_target(tick_start).is_some() => (
++                    bringup
++                        .homing_target(tick_start)
++                        .expect("just checked it is Some"),
++                    policy_cfg.gain,
++                    true,
++                    "homing",
++                    None,
++                ),
++                _ => (hold, policy_cfg.gain, false, "held", None),
++            };
+         state.moving.store(moving, Ordering::Relaxed);
+ 
+         // The theremin: a hand's distance in front of the beak, turned into a note and a
+@@ -2172,7 +2187,11 @@ async fn control_loop<T: RobotIo>(
+         // The mouth is not part of any policy; the intent is the only thing that moves it.
+         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
+         // a restart cannot snap a mouth.
+-        if driving && theremin_state.is_none() && chorale_state.is_none() {
++        if let Some(open) = skill_mouth {
++            // The body policy and release clock are one skill. Its mouth target wins over
++            // every ambient mouth owner so release timing cannot race a client intent.
++            targets[duck_control::model::MOUTH_INDEX] = duck_control::model::mouth_target(open);
++        } else if driving && theremin_state.is_none() && chorale_state.is_none() {
+             targets[duck_control::model::MOUTH_INDEX] =
+                 duck_control::model::mouth_target(snapshot.mouth);
+         }
+@@ -2722,6 +2741,7 @@ fn dispatch(
+                 // One load for the whole decision: these are the *current* mode's networks, and
+                 // reading them field by field could straddle a mode switch.
+                 proto::Skill::GroundPick => policies.ground_pick.is_some(),
++                proto::Skill::BeakThrow => policies.beak_throw.is_some(),
+                 proto::Skill::KickLeft => policies.kick_left.is_some(),
+                 proto::Skill::KickRight => policies.kick_right.is_some(),
+                 proto::Skill::SitToggle => policies.sitstand.is_some(),
+@@ -2901,6 +2921,7 @@ fn dispatch(
+                     stand: policies.stand.clone(),
+                     sitstand: policies.sitstand.clone(),
+                     ground_pick: policies.ground_pick.clone(),
++                    beak_throw: policies.beak_throw.clone(),
+                     kick_left: policies.kick_left.clone(),
+                     kick_right: policies.kick_right.clone(),
+                     roulade: policies.roulade.clone(),
+diff --git a/scripts/dev-push.sh b/scripts/dev-push.sh
+index ee42b6d..65145da 100755
+--- a/scripts/dev-push.sh
++++ b/scripts/dev-push.sh
+@@ -400,6 +400,7 @@ cargo run -p xtask -- package \
+     --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx" \
+     --include "policies/alpha_sitstand.onnx=policies/alpha_sitstand.onnx" \
+     --include "policies/alpha_ground_pick.onnx=policies/alpha_ground_pick.onnx" \
++    --include "policies/beak_throw.onnx=policies/beak_throw.onnx" \
+     --include "policies/ball_kick_left.onnx=policies/ball_kick_left.onnx" \
+     --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
+     --include "policies/roller.onnx=policies/roller.onnx" \

@@ -1,0 +1,65 @@
+MICRODUCK BEAK THROW V1 — RANDOMIZED SIMULATOR ACCEPTANCE
+Date: 2026-09-01
+Task: Mjlab-BeakThrow-Hardware-MicroDuck
+Throw policy: beak_throw.onnx
+Throw checkpoint: q2p/beak-hardware-straight-v3-20260901-a100/model_2150.pt
+Throw SHA-256: 8638bbd29b672d84bcd426b02fa49eb6224ab57b29f5556b4003f3052bf5cecd
+Stand policy: alpha_stand.onnx
+Stand SHA-256: 1569268713e40deea795dd2922dba50d3621e15a872855408b6b1b125b1c094b
+
+METHOD
+- 50 episodes, deterministic seeds 0 through 49.
+- Per-episode randomized initial heading over 360 degrees, joint position
+  noise, projectile spawn height, mass/inertia, friction, armature, COM,
+  encoder bias, and battery/actuator fields from the hardware task.
+- 1.0 trained action scale and 1.75 A simulated current limit.
+- Raw policy targets were measured, then actual targets were clipped to the
+  same anatomical joint limits enforced by the patched robot runtime.
+- At exactly 2.4 seconds the evaluator switched to the packaged standing ONNX.
+- Runtime-equivalent first-tick filters were applied: head alpha 0.5 and legs
+  alpha 0.7, starting from the final throw target.
+- The standing policy was evaluated for an additional 2.0 seconds.
+
+STRICT GATE
+- Valid release and landing.
+- Forward carry >= 0.50 m.
+- Absolute lateral carry <= 0.20 m.
+- Raw, unclamped target-limit excess <= 0.15 rad.
+- Required success rate: 90%.
+
+RESULT
+- Valid release and landing: 50/50.
+- Carry and lateral requirements: 50/50.
+- Strict complete gate: 0/50.
+- Failure reason: raw target-limit excess in every episode.
+
+METRICS (median / p10 / minimum where applicable)
+- Release forward: 2.029 / 1.977 / 1.962 m/s.
+- Release upward: 0.411 / 0.340 / 0.301 m/s.
+- Release lateral: -0.429 / -0.559 / -0.627 m/s.
+- Actual forward carry: 0.525 / 0.518 / 0.502 m.
+- Lateral carry: -0.113 / -0.147 / -0.163 m.
+- Maximum trunk tilt: median 13.829 degrees.
+- Tilt at throw-to-stand handoff: median 13.766 degrees.
+- Final tilt after the two-second stand phase: median 0.376 degrees.
+- Raw target-limit excess: 0.751 / 0.743 / 0.736 rad.
+
+DISPOSITION
+The simulator demonstrates a consistent straight throw and successful hybrid
+recovery when the mandatory runtime clamp is active. The policy does not pass
+the production-style raw-output criterion. It is authorized only as an
+experimental, supervised, empty-beak-first test using the patched runtime and
+the stop conditions in INSTALL_AND_TEST.md. A successful simulator result does
+not establish physical-hardware safety.
+
+EVALUATION COMMAND
+MPLCONFIGDIR=/private/tmp/microduck-mpl \
+XDG_CACHE_HOME=/private/tmp/microduck-cache \
+.venv/bin/python scripts/eval_beak.py \
+  handoff/beak_throw_hw_v1_20260901/beak_throw.onnx \
+  --episodes 50 \
+  --clip-targets-to-joint-limits \
+  --stand-policy handoff/beak_throw_hw_v1_20260901/alpha_stand.onnx \
+  --post-handoff-s 2.0 \
+  --min-carry 0.50 \
+  --min-success-rate 0.90

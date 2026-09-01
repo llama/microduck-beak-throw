@@ -1,0 +1,22 @@
+<mujoco model="microduck_toss_ball">
+    <compiler angle="radian" autolimits="true"/>
+
+    <worldbody>
+        <!-- 24mm-diameter, 3g foam ball for the bill-tray toss (Header task).
+             Solid-sphere inertia (2/5) m r^2 = 1.728e-7 kg m^2.
+             contype=2 / conaffinity=1: collides with the floor, trunk and legs
+             (contype/conaffinity 1) and with the bill tray (contype 2,
+             conaffinity 3), but NOT with the head shells (remapped to
+             contype 4 / conaffinity 1 in get_toss_spec). The tray is the
+             ball's ONLY interface with the head — the only physical way the
+             policy can accelerate the ball is by moving the bill, which makes
+             the contact masks themselves the anti-cheat gate. -->
+        <body name="ball" pos="0.3 0 0.012">
+            <freejoint name="ball_free"/>
+            <inertial pos="0 0 0" mass="0.003" diaginertia="1.728e-7 1.728e-7 1.728e-7"/>
+            <geom type="sphere" name="ball_geom" size="0.012" rgba="1 0.3 0.1 1"
+                  contype="2" conaffinity="1" friction="1.0 0.005 0.0001"
+                  solref="0.03 1.0"/>
+        </body>
+    </worldbody>
+</mujoco>

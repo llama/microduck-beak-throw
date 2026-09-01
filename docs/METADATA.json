@@ -1,0 +1,57 @@
+{
+  "bundle": "beak_throw_hw_v1_20260901",
+  "created_date": "2026-09-01",
+  "status": "experimental_supervised_empty_beak_first",
+  "training": {
+    "provider": "Hugging Face Jobs",
+    "job_id": "6a972c0b21c5aa7c8364c3c9",
+    "model_repository": "q2p/beak-hardware-straight-v3-20260901-a100",
+    "run": "2026-09-01_19-50-07_beak-hardware-straight-v3-20260901-a100",
+    "selected_checkpoint": "model_2150.pt",
+    "final_checkpoint_evaluated_but_not_selected": "model_2249.pt",
+    "source_base_git_sha": "d424a0c899f6b33cbd3daeb279913134349c0b63",
+    "source_snapshot": "src-20260901-154822.tar.gz"
+  },
+  "runtime": {
+    "repository": "pollen-robotics/microduck",
+    "patch_base_git_sha": "590b986bd8c0d50ae02cb3ea2f59c463b6828168",
+    "throw_period_seconds": 2.4,
+    "action_scale": 1.0,
+    "target_clamp_required": true,
+    "stand_handoff_seconds": 2.4,
+    "post_handoff_evaluation_seconds": 2.0
+  },
+  "policy": {
+    "file": "beak_throw.onnx",
+    "sha256": "8638bbd29b672d84bcd426b02fa49eb6224ab57b29f5556b4003f3052bf5cecd",
+    "input_name": "obs",
+    "input_shape": [1, 61],
+    "output_name": "actions",
+    "output_shape": [1, 14]
+  },
+  "stand_policy": {
+    "file": "alpha_stand.onnx",
+    "sha256": "1569268713e40deea795dd2922dba50d3621e15a872855408b6b1b125b1c094b"
+  },
+  "mouth": {
+    "policy_controlled": false,
+    "hold_degrees": 20.0,
+    "open_degrees": 30.0,
+    "opening_phase_start": 0.30,
+    "opening_phase_end": 0.34
+  },
+  "projectile": {
+    "simulated_diameter_mm": 24.0,
+    "simulated_mass_g": 3.0
+  },
+  "evaluation": {
+    "episodes": 50,
+    "valid_and_landed": 50,
+    "carry_and_lateral_passed": 50,
+    "strict_raw_output_gate_passed": 0,
+    "median_carry_m": 0.525,
+    "median_lateral_m": -0.113,
+    "median_final_tilt_deg": 0.376,
+    "median_raw_target_limit_excess_rad": 0.751
+  }
+}

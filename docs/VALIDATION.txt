@@ -1,0 +1,37 @@
+MICRODUCK BEAK THROW V1 — SOFTWARE VALIDATION
+Date: 2026-09-01
+
+POLICY AND ARTIFACT VALIDATION
+- beak_throw.onnx: obs[1,61] -> actions[1,14], float tensors.
+- alpha_stand.onnx: obs[1,61] -> actions[1,14], float tensors.
+- METADATA.json parsed successfully.
+- beak_liner_lower_reference.stl: watertight, one component, 1664.0 mm^3.
+- beak_liner_upper_reference.stl: watertight, one component, 2438.0 mm^3.
+- git diff --check passed for the runtime and handoff bundle.
+- microduck-runtime.patch passed `git apply --check --reverse` against the
+  modified checkout based on commit 590b986bd8c0d50ae02cb3ea2f59c463b6828168.
+- microduck-runtime.patch also passed a forward `git apply --check` against a
+  fresh archive of that exact base commit.
+
+RUNTIME TESTS
+- duck-control: 60 passed.
+- duck-ipc-proto: 49 passed.
+- robotctl: 138 passed, 3 ignored visual/manual probes.
+- robotd: 98 unit tests passed.
+- robotd updater-gate integration: 7 passed.
+- robotd-params: 25 passed.
+- xtask every_policy_in_the_repo_is_packaged: 1 passed.
+
+The updater-gate integration tests require temporary Unix sockets. Their first
+sandboxed invocation was blocked by the sandbox with `Operation not permitted`;
+the exact integration target was rerun with socket permission and passed 7/7.
+
+SIMULATOR VALIDATION
+- See ACCEPTANCE.txt for the 50-episode randomized throw-to-stand evaluation.
+- Dynamic clamped behavior: 50/50 valid releases, landings, forward-carry
+  thresholds, lateral thresholds, and recoveries.
+- Strict raw-output gate: 0/50 because the policy requested targets beyond an
+  anatomical limit before the mandatory runtime clamp.
+
+This validation supports a supervised empty-beak-first experiment. It does not
+certify the motion as safe on unmeasured physical hardware.
