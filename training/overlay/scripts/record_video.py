@@ -38,6 +38,14 @@ parser.add_argument("--height", type=int, default=1080)
 parser.add_argument("--azimuth", type=float, default=None)
 parser.add_argument("--orbit-degrees", type=float, default=0.0,
                     help="smoothly add this many azimuth degrees over the complete video")
+parser.add_argument(
+    "--heading-relative-azimuths",
+    default=None,
+    help=(
+        "comma-separated fixed camera azimuth offsets from each episode's reset "
+        "heading; 180 looks into the throw, +90/-90 are opposing side views"
+    ),
+)
 parser.add_argument("--elevation", type=float, default=None)
 parser.add_argument("--distance", type=float, default=None)
 parser.add_argument("--fps", type=int, default=50, help="output fps (50 = realtime, 25 = half speed)")
@@ -49,6 +57,18 @@ parser.add_argument("--episode-length", type=float, default=None,
 parser.add_argument("--no-early-termination", action="store_true",
                     help="drop all terminations except time_out — nothing cuts the take")
 args = parser.parse_args()
+
+heading_relative_azimuths = None
+if args.heading_relative_azimuths:
+    heading_relative_azimuths = [
+        float(value.strip())
+        for value in args.heading_relative_azimuths.split(",")
+        if value.strip()
+    ]
+    if len(heading_relative_azimuths) != args.episodes:
+        parser.error(
+            "--heading-relative-azimuths must contain one value per episode"
+        )
 
 env_cfg = load_env_cfg(args.task, play=True) if "play" in load_env_cfg.__code__.co_varnames else load_env_cfg(args.task)
 env_cfg.seed = args.seed
@@ -88,11 +108,33 @@ if args.episodes > 1:
     steps_per_episode = args.steps_per_episode or wrapped.max_episode_length
 total_steps = args.episodes * steps_per_episode
 start_azimuth = env_cfg.viewer.azimuth
+
+
+def camera_azimuth_for_episode(episode: int) -> float | None:
+    if heading_relative_azimuths is None:
+        return None
+    robot = env.scene["robot"]
+    root = env.sim.data.qpos[0, robot.indexing.free_joint_q_adr]
+    qw, qx, qy, qz = root[3], root[4], root[5], root[6]
+    yaw = torch.atan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy * qy + qz * qz),
+    )
+    heading_deg = float(torch.rad2deg(yaw).item())
+    return heading_deg + heading_relative_azimuths[episode]
+
+
 with torch.no_grad():
     for episode in range(args.episodes):
         if episode:
             wrapped.seed(args.seed + episode)
             obs, _ = wrapped.reset()
+        fixed_azimuth = camera_azimuth_for_episode(episode)
+        if fixed_azimuth is not None:
+            print(
+                f"  episode {episode + 1}: fixed camera azimuth "
+                f"{fixed_azimuth:.1f} degrees"
+            )
         for step in range(steps_per_episode):
             actions = policy(obs)
             obs, _, _, _ = wrapped.step(actions)
@@ -100,7 +142,9 @@ with torch.no_grad():
             if env._offline_renderer is not None:
                 progress = global_step / max(total_steps - 1, 1)
                 env._offline_renderer._cam.azimuth = (
-                    start_azimuth + args.orbit_degrees * progress
+                    fixed_azimuth
+                    if fixed_azimuth is not None
+                    else start_azimuth + args.orbit_degrees * progress
                 )
             frame = env.render()
             if frame is not None:
