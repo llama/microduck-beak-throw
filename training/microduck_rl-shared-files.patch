@@ -732,7 +732,7 @@ index 8aa7b23..9f91701 100644
 +    lower_bill_visual = next(
 +        g
 +        for g in jaw.geoms
-+        if g.meshname == "bottom_head_shell"
++        if g.meshname == "jaw_soft"
 +        and g.classname
 +        and g.classname.name == "visual"
 +    )
@@ -768,8 +768,8 @@ index 8aa7b23..9f91701 100644
 +    lower.add_geom(
 +        name="beak_lower_visual",
 +        type=mujoco.mjtGeom.mjGEOM_MESH,
-+        meshname="bottom_head_shell",
-+        material="bottom_head_shell_material",
++        meshname="jaw_soft",
++        material="jaw_soft_material",
 +        pos=list(np.asarray(lower_bill_visual.pos, dtype=float) - pivot),
 +        quat=list(lower_bill_visual.quat),
 +        group=2,
